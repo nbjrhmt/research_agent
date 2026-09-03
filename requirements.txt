@@ -1,0 +1,11 @@
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+# 联网搜索统一走博查(Bocha) Web Search API(已移除 ddgs/必应抓取方案, 不再需要 ddgs 包)
+requests>=2.31.0
+pypdf>=4.0.0
+chromadb>=0.5.0
+streamlit>=1.36.0
+pandas>=2.0.0
+matplotlib>=3.8.0
+python-dotenv>=1.0.1

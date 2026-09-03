@@ -1,0 +1,27 @@
+# 虚拟环境
+.venv/
+venv/
+
+# 密钥文件，严禁上传真实密钥
+.env
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyCharm IDE配置
+.idea/
+*.iml
+
+# 运行时临时文件
+temp_upload/
+report_history.json
+
+# 日志
+*.log
+logs/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
