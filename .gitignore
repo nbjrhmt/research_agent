@@ -5,6 +5,10 @@ venv/
 # 密钥文件，严禁上传真实密钥
 .env
 
+# .env 的其余变体(本地/生产覆盖配置)一律忽略, 但保留 .env.example 模板
+.env.*
+!.env.example
+
 # Python缓存
 __pycache__/
 *.py[cod]
@@ -21,6 +25,23 @@ report_history.json
 # 日志
 *.log
 logs/
+
+# ChromaDB 向量库(长期记忆预留模块的持久化目录, 启用后也不入库)
+chroma_db/
+
+# 测试 / 静态检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+# pytest 在无法写 .pytest_cache 时退避生成的根目录缓存文件(正常环境不会出现)
+pytest-cache-files-*
+*.egg-info/
+build/
+dist/
+
+# streamlit 本地配置(如 config.toml)
+.streamlit/
 
 # 系统垃圾
 .DS_Store

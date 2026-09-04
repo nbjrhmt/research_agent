@@ -19,6 +19,10 @@ import uuid
 
 import streamlit as st
 
+from logging_setup import get_logger
+
+_logger = get_logger("main")
+
 
 # 页面配置必须在任何 st 组件之前
 st.set_page_config(page_title="本地个人调研Agent", page_icon="🔎", layout="wide")
@@ -59,8 +63,8 @@ def _load_report_history_from_disk() -> list:
                 valid.append(rec)
         return valid[:MAX_HISTORY]
     except Exception as exc:  # noqa: BLE001 —— JSON 损坏 / 编码错误 / IO 异常等一律容错
-        print(f"[警告] 读取 {REPORT_HISTORY_FILE} 失败({type(exc).__name__}: {exc}), "
-              f"已降级为内存模式, 本次启动历史为空。")
+        _logger.warning("读取 %s 失败(%s: %s), 已降级为内存模式, 本次启动历史为空。",
+                        REPORT_HISTORY_FILE, type(exc).__name__, exc)
         return []
 
 
@@ -73,8 +77,8 @@ def _save_report_history_to_disk(history: list) -> None:
         with open(REPORT_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception as exc:  # noqa: BLE001
-        print(f"[警告] 写入 {REPORT_HISTORY_FILE} 失败({type(exc).__name__}: {exc}), "
-              f"历史仅保留在内存中, 重启后可能丢失。")
+        _logger.warning("写入 %s 失败(%s: %s), 历史仅保留在内存中, 重启后可能丢失。",
+                        REPORT_HISTORY_FILE, type(exc).__name__, exc)
 
 
 def _clear_report_history_on_disk() -> None:
@@ -91,13 +95,105 @@ if "report_history" not in st.session_state:
 TEMP_UPLOAD_DIR = os.path.join(BASE_DIR, "temp_upload")  # 上传文件/图表存放目录
 os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
 
+
+# ============================ 🧹 临时文件生命周期管理 ============================
+# 上传文件/图表/部分成果只增不减会持续占用磁盘, 这里统一管理:
+#   1) 应用启动(首个会话): 清空 temp_upload/ 残留(上一进程遗留的上传/图表/沙盒临时文件);
+#   2) 每次开始新调研前: 清理上一轮遗留文件, 但保留当前结果面板仍在引用的图表;
+#   3) 每次调研结束(成功/失败): 删除本次上传文件的磁盘副本(内容已进入素材/历史);
+# 说明: 当前 run 的图表要用于结果面板展示, 保留到下一次任务开始时再清理(最多保留两轮)。
+def _cleanup_temp_files(keep_files: list = None) -> None:
+    """清理 temp_upload/ 下可删除的临时文件; keep_files: 需保留的绝对路径列表。
+
+    删除失败只记日志, 不影响主流程; .sandbox_runs 子目录内的沙盒临时文件一并清理。
+
+    ★ 工程边界备注(并发竞争条件, 见 README「已知项目局限」): 本函数只适合"单进程
+      Streamlit"模式。若多进程/多实例共享同一 temp_upload/ 目录, 会出现清理竞争:
+      一个实例可能删除另一个实例刚生成/仍在使用的上传文件、partial_*.json 或图表
+      (先 listdir 后逐个删除, 期间无跨进程锁)。多实例部署前需改为按任务目录隔离
+      或引入互斥/引用计数, 当前版本不实现。
+    """
+    keep = set()
+    for p in keep_files or []:
+        try:
+            keep.add(os.path.normcase(os.path.abspath(str(p))))
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        for name in os.listdir(TEMP_UPLOAD_DIR):
+            item = os.path.join(TEMP_UPLOAD_DIR, name)
+            if os.path.isdir(item):
+                # 沙盒运行子目录: 只清内容, 目录保留(代码执行工具按需自建)
+                if name == ".sandbox_runs":
+                    for inner in os.listdir(item):
+                        try:
+                            os.remove(os.path.join(item, inner))
+                        except OSError as exc:
+                            _logger.warning("清理沙盒临时文件失败 %s: %s", inner, exc)
+                continue
+            if os.path.normcase(os.path.abspath(item)) in keep:
+                continue
+            try:
+                os.remove(item)
+            except OSError as exc:
+                _logger.warning("清理临时文件失败 %s: %s", item, exc)
+    except OSError as exc:
+        _logger.warning("清理 temp_upload/ 失败: %s", exc)
+
+
+def _delete_uploaded_files(fnames: list) -> None:
+    """调研结束后删除本次上传文件的磁盘副本(素材文本已在 State/历史中)。"""
+    for fname in fnames or []:
+        path = os.path.join(TEMP_UPLOAD_DIR, fname)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            _logger.warning("删除本次上传文件副本失败 %s: %s", path, exc)
+
+
+def _save_partial_run(state_values: dict, error_text: str = "") -> str:
+    """任务异常兜底: 把已搜集素材(含上传文件预读素材)落盘为 partial JSON。
+
+    P0-4 要求: 任何异常路径(LLM 重试全失败 / 沙盒致命错误 / 搜索 API 报错 / 任务异常)
+    只要能取回素材就必须落盘并提供下载, 杜绝静默失败; 落盘失败会抛异常, 由调用方在 UI
+    明确提示"部分素材保存失败"(不掩盖原始任务错误)。
+    """
+    payload = {
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "note": "任务异常中断时自动保存的已搜集素材(partial 兜底), 可直接阅读或复制给新任务使用",
+        "error": error_text[:500] if error_text else "",
+        "user_query": state_values.get("user_query", ""),
+        "sub_tasks": state_values.get("sub_tasks") or [],
+        "iteration_count": state_values.get("iteration_count") or 0,
+        "collected_info": state_values.get("collected_info") or [],
+    }
+    fname = f"partial_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.json"
+    path = os.path.join(TEMP_UPLOAD_DIR, fname)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001 —— 落盘失败必须抛给调用方在 UI 显式提示
+        _logger.exception("保存部分成果失败: %s", exc)
+        raise
+    return path
+
+
+if "temp_boot_cleanup_done" not in st.session_state:
+    # 应用启动(首个会话): 清理上一进程遗留的临时文件, 防止磁盘持续膨胀
+    _cleanup_temp_files()
+    st.session_state["temp_boot_cleanup_done"] = True
+
 try:
     # 依赖导入放在 try 里, 方便给用户明确的安装提示
     from dotenv import load_dotenv
 
     load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-    from graph_builder import MAX_ITERATIONS, build_graph, build_llm
+    from graph_builder import (
+        ALLOW_CODE_EXEC, DEFAULT_MODEL, MAX_ITERATIONS, build_graph, build_llm,
+    )
+    from langgraph.checkpoint.memory import InMemorySaver  # 异常兜底: 取回已搜集素材
     from tools.search_tool import bocha_web_search  # 联网搜索: 博查(Bocha) API
 except Exception as exc:  # noqa: BLE001
     st.error(f"依赖导入失败, 请先安装依赖: pip install -r requirements.txt\n\n原始错误:\n{exc}")
@@ -140,7 +236,7 @@ def _preview_csv(file_path: str, head_rows: int = 20, max_chars: int = 10000) ->
     if df is None:
         return f"【工具异常】CSV 读取失败(编码/格式无法识别): {errors[0] if errors else '未知错误'}"
     if df.shape[1] == 0 or df.shape[0] == 0:
-        return f"【提示】CSV 内容是空的(0 行 0 列)。"
+        return "【提示】CSV 内容是空的(0 行 0 列)。"
 
     lines = [
         f"行数: {len(df)}  |  列数: {df.shape[1]}",
@@ -173,6 +269,67 @@ def _ingest_upload(fname: str):
 
 
 # ============================ 图执行与实时日志 ============================
+def _salvage_run_materials(exc: Exception, graph, config, user_query: str,
+                           fallback_materials: list) -> None:
+    """
+    P0-4 异常素材兜底(由 _render_graph_run 的 except 分支调用, 覆盖全部异常路径):
+        1. 优先读取 LangGraph checkpointer 快照(已跑过节点时, 素材最完整);
+           读不到快照(异常发生在 build_llm / 首个节点之前)则退回本地追踪的
+           fallback_materials(至少包含上传文件预读素材);
+        2. 素材非空 → 落盘 temp_upload/partial_*.json, 并把路径写入
+           st.session_state["last_salvage"], 供外层 UI 提示 + 下载按钮;
+        3. 素材为空 → last_salvage.path=None, UI 明确提示"无素材可保留"(不静默);
+        4. 兜底自身失败 → 记录 last_salvage_error, UI 显式报错, 不掩盖原始任务异常。
+    """
+    try:
+        snapshot_values = None
+        if graph is not None and config is not None:
+            try:
+                snapshot = graph.get_state(config)
+                values = getattr(snapshot, "values", None)
+                if values is None and isinstance(snapshot, tuple) and snapshot:
+                    values = snapshot[0]
+                if isinstance(values, dict):
+                    snapshot_values = values
+            except Exception as inner:  # noqa: BLE001 —— 无任何节点快照属正常(异常发生得过早)
+                _logger.warning("异常兜底-读取 checkpointer 快照失败, 改用本地追踪素材: %s", inner)
+        if snapshot_values is not None:
+            state_values = snapshot_values
+        else:
+            # 还没跑过任何节点(如 build_llm 抛错): 退回本地追踪素材
+            state_values = {
+                "user_query": user_query,
+                "sub_tasks": [],
+                "iteration_count": 0,
+                "collected_info": fallback_materials,
+            }
+        materials = state_values.get("collected_info") or []
+        if not materials and fallback_materials:  # 防御性合并: 快照异常为空时用本地追踪
+            state_values = dict(state_values)
+            state_values["collected_info"] = fallback_materials
+            materials = fallback_materials
+
+        error_text = f"{type(exc).__name__}: {exc}"
+        if materials:
+            salvage_path = _save_partial_run(state_values, error_text=error_text)
+            st.session_state["last_salvage"] = {
+                "path": salvage_path,
+                "count": len(materials),
+                "query": user_query,
+            }
+            _logger.warning("任务异常(%s), 已落盘 %s 条素材到 %s",
+                            error_text[:200], len(materials), salvage_path)
+        else:
+            st.session_state["last_salvage"] = {"path": None, "count": 0, "query": user_query}
+            _logger.warning("任务异常(%s), 异常前尚未搜集到素材, 无 partial 文件可保留",
+                            error_text[:200])
+    except Exception as exc2:  # noqa: BLE001 —— 兜底失败也要在 UI 显式报错, 杜绝静默失败
+        st.session_state["last_salvage"] = {"path": None, "count": -1, "query": user_query}
+        st.session_state["last_salvage_error"] = f"{type(exc2).__name__}: {exc2}"
+        _logger.exception("任务异常后的素材落盘兜底也失败(原始异常 %s): %s",
+                          type(exc).__name__, exc2)
+
+
 def _render_graph_run(user_query: str, fnames: list):
     """
     运行 LangGraph 主流程并实时展示每一步:
@@ -200,52 +357,74 @@ def _render_graph_run(user_query: str, fnames: list):
         "steps_log": [],
     }
 
-    llm = build_llm()          # 未配置 Key 时会在这里抛错, 由外层捕获提示
-    graph = build_graph(llm, web_search_tool=bocha_web_search)  # 博查API联网搜索
-    run_started_at = time.time()  # 用于识别本轮新生成的图表
-
+    # =====================================================================
+    # P0-4 异常素材兜底: 从"构建 LLM"到"图流式执行"全程纳入 try 范围 —— 任何一步抛错
+    # (LLM 重试全部失败 / 沙盒致命错误 / 搜索 API 报错 / 任务运行异常等), 只要存在
+    # 已搜集素材就落盘 partial JSON, UI 给出提示并支持下载, 杜绝静默失败。
+    # 素材来源优先级: ① LangGraph checkpointer 快照(已跑过节点时, 含最新素材);
+    #                ② 本地增量追踪的 fallback_materials(尚未产生任何节点快照时,
+    #                  至少保留上传文件预读素材)。
+    # =====================================================================
+    progress_bar = st.progress(0.0)
+    run_started_at = time.time()      # 用于识别本轮新生成的图表
+    fallback_materials = list(initial_materials)   # 随事件流增量追加, 兜底素材源
     total_materials = len(initial_materials)
     max_round = 0
     final_report = ""
-    progress_bar = st.progress(0.0)
+    llm = None
+    graph = None
+    config = None
 
     # stream_mode="updates": 每执行完一个节点就产出一次 {节点名: 该节点更新的字段}
-    for event in graph.stream(initial_state, stream_mode="updates"):
-        for node_name, payload in event.items():
-            if node_name.startswith("__"):
-                continue  # 跳过 LangGraph 内部节点
+    try:
+        llm = build_llm()   # 未配置 Key 时会在这里抛错, 由下方兜底 + 外层提示
+        # LangGraph checkpointer 兜底(工程边界: InMemorySaver 仅单进程内存, 服务重启即丢,
+        # 只适合单机演示; 中途异常素材靠下面落盘 partial JSON 保留, 见 README 已知局限)
+        checkpointer = InMemorySaver()
+        thread_id = uuid.uuid4().hex[:12]
+        config = {"configurable": {"thread_id": thread_id}}
+        graph = build_graph(llm, web_search_tool=bocha_web_search, checkpointer=checkpointer)  # 博查API联网搜索
+        for event in graph.stream(initial_state, config=config, stream_mode="updates"):
+            for node_name, payload in event.items():
+                if node_name.startswith("__"):
+                    continue  # 跳过 LangGraph 内部节点
 
-            icon_title = _NODE_ICONS.get(node_name, node_name)
-            st.markdown(f"**▶ {icon_title}**")
+                icon_title = _NODE_ICONS.get(node_name, node_name)
+                st.markdown(f"**▶ {icon_title}**")
 
-            # 1) 实时日志行
-            for line in payload.get("steps_log") or []:
-                st.markdown(f"- {line}")
+                # 1) 实时日志行
+                for line in payload.get("steps_log") or []:
+                    st.markdown(f"- {line}")
 
-            # 2) 规划结果: 展示子任务列表
-            if node_name == "planner_node" and payload.get("sub_tasks"):
-                for i, task in enumerate(payload["sub_tasks"], start=1):
-                    st.markdown(f"  🎯 子任务{i}: {task}")
+                # 2) 规划结果: 展示子任务列表
+                if node_name == "planner_node" and payload.get("sub_tasks"):
+                    for i, task in enumerate(payload["sub_tasks"], start=1):
+                        st.markdown(f"  🎯 子任务{i}: {task}")
 
-            # 3) 工具节点: 展示本轮新增素材片段 + 进度条
-            if node_name == "tool_node":
-                for entry in payload.get("collected_info") or []:
-                    with st.expander("查看本轮素材片段(前 1200 字)", expanded=False):
-                        st.text(str(entry)[:1200])
-                max_round = int(payload.get("iteration_count") or max_round)
-                total_materials += len(payload.get("collected_info") or [])
-                progress_bar.progress(min(max_round / MAX_ITERATIONS, 1.0))
+                # 3) 工具节点: 展示本轮新增素材片段 + 进度条
+                if node_name == "tool_node":
+                    for entry in payload.get("collected_info") or []:
+                        with st.expander("查看本轮素材片段(前 1200 字)", expanded=False):
+                            st.text(str(entry)[:1200])
+                    max_round = int(payload.get("iteration_count") or max_round)
+                    added = payload.get("collected_info") or []
+                    total_materials += len(added)
+                    fallback_materials.extend(added)   # 增量追踪, 供异常兜底使用
+                    progress_bar.progress(min(max_round / MAX_ITERATIONS, 1.0))
 
-            # 4) 反思节点: 高亮结论
-            if node_name == "reflection_node" and payload.get("reflection"):
-                reflection_text = str(payload["reflection"])
-                marker = "✅ 反思结论(信息充足)" if "任务信息充足" in reflection_text or "信息充足" in reflection_text else "⚠️ 反思结论(继续搜集)"
-                with st.expander(f"{marker}: 查看完整反思", expanded=False):
-                    st.text(reflection_text)
+                # 4) 反思节点: 高亮结论
+                if node_name == "reflection_node" and payload.get("reflection"):
+                    reflection_text = str(payload["reflection"])
+                    marker = "✅ 反思结论(信息充足)" if "任务信息充足" in reflection_text or "信息充足" in reflection_text else "⚠️ 反思结论(继续搜集)"
+                    with st.expander(f"{marker}: 查看完整反思", expanded=False):
+                        st.text(reflection_text)
 
-            # 5) 报告节点: 暂存报告, 最后统一渲染
-            if node_name == "report_node" and payload.get("final_report"):
-                final_report = str(payload["final_report"])
+                # 5) 报告节点: 暂存报告, 最后统一渲染
+                if node_name == "report_node" and payload.get("final_report"):
+                    final_report = str(payload["final_report"])
+    except Exception as exc:  # noqa: BLE001 —— P0-4: 全部异常路径统一走素材落盘兜底
+        _salvage_run_materials(exc, graph, config, user_query, fallback_materials)
+        raise  # 原始异常继续抛出, 由外层(main 执行区)统一渲染错误提示
 
     progress_bar.empty()
 
@@ -319,7 +498,7 @@ with st.sidebar:
         st.success("✅ API Key 已从 .env 环境变量加载完成")
     else:
         st.error("❌ 未配置 API Key：请编辑项目根目录 .env 文件，配置完成后刷新页面")
-    st.write(f"- 模型: {os.getenv('LLM_MODEL', '').strip() or 'gpt-4o-mini'}")
+    st.write(f"- 模型: {os.getenv('LLM_MODEL', '').strip() or DEFAULT_MODEL}")
     st.write(f"- 接口: {os.getenv('OPENAI_BASE_URL', '').strip() or 'OpenAI 官方'}")
     bocha_key = os.getenv("BOCHA_API_KEY", "").strip()
     if bocha_key and not bocha_key.startswith("你的"):
@@ -329,9 +508,12 @@ with st.sidebar:
     st.divider()
     st.subheader("🛡️ 安全边界")
     st.write(f"- 工具最多迭代 {MAX_ITERATIONS} 轮, 到达上限自动生成报告")
-    st.write("- 代码沙盒仅允许 pandas / matplotlib, 禁止删除修改文件")
+    if ALLOW_CODE_EXEC:
+        st.write("- 代码沙盒仅允许 pandas / matplotlib, 禁止删除修改文件")
+    else:
+        st.write("- 代码沙盒: 已整体关闭(ALLOW_CODE_EXEC=false), Agent 不执行任何代码")
     st.write("- 报告只基于素材, 严禁编造素材中不存在的事实")
-    st.write(f"- 上传文件与图表保存在: `temp_upload/`")
+    st.write("- 上传文件与图表保存在: `temp_upload/`")
 
     # ============================ 📜 历史调研报告面板 ============================
     # 数据来源: st.session_state.report_history(内存, 每次启动从 report_history.json 自动恢复;
@@ -406,13 +588,26 @@ if start_clicked:
     if not topic:
         st.warning("请先输入调研主题。")
     else:
-        # 1) 保存上传文件
+        # 0) 启动前置校验: BOCHA_API_KEY 未配置时明确提示联网搜索不可用(不阻断, 可仅基于上传素材运行)
+        bocha_key = (os.getenv("BOCHA_API_KEY", "") or "").strip()
+        if not bocha_key or bocha_key.startswith("你的"):
+            st.warning("未配置 BOCHA_API_KEY: 联网搜索当前不可用, 任务将只能基于上传素材/已有资料进行。"
+                       "如需联网检索, 请在项目根目录 .env 填入博查 Key 后刷新页面。")
+
+        # 0.5) 开始新任务前自动清理过期临时文件(保留当前结果面板仍在引用的图表)
+        keep_images = (st.session_state.get("last_run") or {}).get("images") or []
+        _cleanup_temp_files(keep_files=keep_images)
+
+        # 1) 保存上传文件(保存失败也要明确提示, 不静默跳过)
         fnames = []
         for up in uploaded_files:
             if up.size is not None and up.size > MAX_FILE_SIZE_MB * 1024 * 1024:
                 st.warning(f"跳过超大文件: {up.name}(>{MAX_FILE_SIZE_MB}MB)")
                 continue
-            fnames.append(_save_upload(up))
+            try:
+                fnames.append(_save_upload(up))
+            except OSError as exc:
+                st.error(f"保存上传文件 {up.name} 失败(磁盘/权限问题): {exc}, 该文件将被跳过")
 
         st.markdown("---")
         st.subheader("3️⃣ 实时执行日志")
@@ -435,12 +630,46 @@ if start_clicked:
             # ---- 调研完整跑完, 拿到 final_report 后自动存入历史(内存 + 同步落盘 json) ----
             # 说明: 函数内部先插入 session_state 内存历史, 再把完整列表覆盖写入 report_history.json。
             _save_report_to_history(topic, report)   # 新报告插到最顶部, 最多保留 20 条, 持久化到本地
+            _delete_uploaded_files(fnames)           # 任务结束: 自动清理本次上传文件的磁盘副本
+            st.session_state.pop("last_salvage", None)  # 成功后清掉上一次的异常兜底提示
+            st.session_state.pop("last_salvage_error", None)
+            _logger.info("调研完成: 「%s」 共 %s 轮 / %s 条素材", topic, used_rounds, material_count)
         except Exception as exc:  # 捕获 LLM 网络错误 / JSON 重试失败 / Key 未配置等, 给出友好提示
             if status is not None:
                 status.update(label="❌ 任务异常终止", state="error")
             st.error(f"任务终止: {exc}")
             st.info("排查建议: ① .env 的 Key/模型名是否正确且已刷新页面; ② 网络能否访问所配接口; "
                     "③ 换一个更常见的模型名; ④ 查看上方日志确认哪一步出错。")
+
+            # ---- 异常兜底展示(P0-4): 无论异常发生在哪一步, 都给出明确的素材去向提示 ----
+            salvage = st.session_state.pop("last_salvage", None)
+            if salvage:
+                if salvage.get("count", 0) == -1:
+                    st.error("⛑ 异常兜底: 部分素材落盘失败, 本次无法保存素材文件。原因: "
+                             f"{st.session_state.pop('last_salvage_error', '未知')}, "
+                             "详见 logs/app.log; 上传文件副本已清理。")
+                elif salvage.get("path"):
+                    st.warning(f"⛑ 已自动保留异常前搜集的 {salvage['count']} 条素材(未白跑, "
+                               f"含上传文件预读素材): `{salvage['path']}`")
+                    try:
+                        with open(salvage["path"], encoding="utf-8") as f:
+                            partial_text = f.read()
+                        st.download_button(
+                            "⬇️ 下载已搜集素材(JSON)",
+                            data=partial_text.encode("utf-8"),
+                            file_name=os.path.basename(salvage["path"]),
+                            mime="application/json",
+                        )
+                        st.caption("提示: partial_*.json 会在下次任务开始清理临时文件时被删除, 请尽快下载。")
+                    except Exception:  # noqa: BLE001 —— 展示失败不影响主错误提示
+                        pass
+                else:
+                    st.info("⛑ 任务异常, 且异常发生在搜集到素材之前: 本次没有可保留/下载的部分素材, "
+                            "请根据上方日志排查后重新运行。")
+            else:
+                st.info("⛑ 任务异常, 未检测到可保留的部分素材(发生在素材搜集阶段之前)。")
+            _delete_uploaded_files(fnames)  # 异常终止也清理本次上传文件副本(素材已落盘兜底)
+            _logger.exception("调研任务异常终止: 「%s」", topic)
 
 # ---------- 结果区(展示最近一次成功结果) ----------
 last_run = st.session_state.get("last_run")

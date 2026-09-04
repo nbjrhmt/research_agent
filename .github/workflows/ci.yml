@@ -1,0 +1,77 @@
+# ==================================================================================
+# GitHub Actions CI —— 离线质量门禁(与 .gitlab-ci.yml 等价, 可按平台任选其一)
+#
+# 三个任务(可并行):
+#   ① test   —— 安装锁文件依赖后运行全部离线 pytest(不调用任何 LLM/搜索 API)
+#   ② lint   —— ruff 代码 lint
+#   ③ lock   —— requirements-lock.txt 与 requirements.txt 一致性校验
+#
+# ⚠️ 本 CI 不运行 tests/_e2e_test.py / tests/test_search.py:
+#    它们会真实调用 LLM 与博查搜索 API、消耗额度, 需要密钥, 不适合 CI 自动执行。
+# ==================================================================================
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 离线单元测试(pytest, 不调用 API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.13(与 requirements-lock.txt 生成环境一致)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装锁定依赖(同时验证锁文件可安装)
+        run: pip install -r requirements-lock.txt
+
+      - name: 安装测试工具
+        run: pip install pytest ruff
+
+      - name: 运行全部离线单元测试
+        run: python -m pytest tests
+
+  lint:
+    name: 代码 lint(ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装 ruff
+        run: pip install ruff
+
+      - name: ruff check(默认规则集 E4/E7/E9/F)
+        run: ruff check .
+
+  lock:
+    name: 依赖锁文件一致性校验
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装 packaging(版本比较)
+        run: pip install packaging
+
+      - name: 校验 requirements-lock.txt 与 requirements.txt 一致
+        run: python scripts/check_lock_consistency.py

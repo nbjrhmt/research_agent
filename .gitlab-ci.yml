@@ -1,0 +1,47 @@
+# ==================================================================================
+# GitLab CI —— 离线质量门禁(与 .github/workflows/ci.yml 等价, 可按平台任选其一)
+#
+# 三个任务(可并行):
+#   ① test —— 安装锁文件依赖后运行全部离线 pytest(不调用任何 LLM/搜索 API)
+#   ② lint —— ruff 代码 lint
+#   ③ lock —— requirements-lock.txt 与 requirements.txt 一致性校验
+#
+# ⚠️ 本 CI 不运行 tests/_e2e_test.py / tests/test_search.py:
+#    它们会真实调用 LLM 与博查搜索 API、消耗额度, 需要密钥, 不适合 CI 自动执行。
+# ==================================================================================
+stages:
+  - test
+  - lint
+  - lock
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+cache:
+  paths:
+    - .pip-cache/
+
+test:
+  stage: test
+  image: python:3.13
+  timeout: 20 minutes
+  script:
+    - pip install -r requirements-lock.txt   # 同时验证锁文件可安装
+    - pip install pytest ruff
+    - python -m pytest tests                 # 全部离线单测(不调用 LLM/搜索 API)
+
+lint:
+  stage: lint
+  image: python:3.13
+  timeout: 10 minutes
+  script:
+    - pip install ruff
+    - ruff check .
+
+lock-consistency:
+  stage: lock
+  image: python:3.13
+  timeout: 10 minutes
+  script:
+    - pip install packaging
+    - python scripts/check_lock_consistency.py

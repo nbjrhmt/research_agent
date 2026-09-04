@@ -54,7 +54,7 @@ def _env_str(name: str, default: str) -> str:
 
 # ============================ 通用: 格式化结果 ============================
 def _format_results(items: list) -> str:
-    """把 [{title,href,body}...] 格式化成文本素材(与历史素材格式保持一致)"""
+    """把博查返回的 [{title,href,body}...] 结构化为统一素材文本(编号 + 标题/链接/摘要)。"""
     lines = [f"共获取 {len(items)} 条结果:"]
     for i, item in enumerate(items, start=1):
         title = str(item.get("title") or "(无标题)")

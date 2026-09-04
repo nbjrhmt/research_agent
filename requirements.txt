@@ -9,3 +9,5 @@ streamlit>=1.36.0
 pandas>=2.0.0
 matplotlib>=3.8.0
 python-dotenv>=1.0.1
+# token 计数(tiktoken): 素材按真实 token 预算裁剪, 替代纯字符截断
+tiktoken>=0.7.0
