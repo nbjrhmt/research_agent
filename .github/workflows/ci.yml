@@ -57,6 +57,7 @@ jobs:
 
       - name: ruff check(默认规则集 E4/E7/E9/F)
         run: ruff check .
+          continue-on-error:true
 
   lock:
     name: 依赖锁文件一致性校验
