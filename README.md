@@ -1,3 +1,4 @@
+![CI](https://github.com/nbjrhmt/research_agent/actions/workflows/ci.yml/badge.svg)
 
 # 🔎 本地个人调研 Agent(LangGraph + Streamlit)
 
