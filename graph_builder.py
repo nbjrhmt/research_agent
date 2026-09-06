@@ -52,6 +52,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
+from core.config import env_flag, env_float, env_int  # 统一环境变量解析(2026 重构 P1)
 from logging_setup import get_logger
 from state_schema import AgentState
 from tools.code_exec_tool import exec_python_code
@@ -83,12 +84,12 @@ MAX_REFLECT_FAILURES = 2  # 连续结构化判定失败上限: 达到后条件�
 # 每轮最多拆解的子任务数
 MAX_SUB_TASKS = 10
 
-# ---- LLM 调用统一配置(可用 .env 覆盖, 见 .env.example) ----
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60") or "60")            # 单次请求超时(秒)
-LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "8192") or "8192")  # 输出 token 上限
-LLM_CLIENT_RETRIES = int(os.getenv("LLM_CLIENT_RETRIES", "2") or "2")  # SDK 客户端层重试次数
-LLM_RETRY_MAX = int(os.getenv("LLM_MAX_RETRIES", "3") or "3")          # 应用层统一重试次数(含简单退避)
-LLM_CONTEXT_TOKENS = int(os.getenv("LLM_CONTEXT_TOKENS", "60000") or "60000")  # 估算上下文窗口(token)
+# ---- LLM 调用统一配置(可用 .env 覆盖, 见 .env.example; 解析统一走 core.config) ----
+LLM_TIMEOUT = env_float("LLM_TIMEOUT", 60.0)            # 单次请求超时(秒)
+LLM_MAX_OUTPUT_TOKENS = env_int("LLM_MAX_OUTPUT_TOKENS", 8192)  # 输出 token 上限
+LLM_CLIENT_RETRIES = env_int("LLM_CLIENT_RETRIES", 2)   # SDK 客户端层重试次数
+LLM_RETRY_MAX = env_int("LLM_MAX_RETRIES", 3)           # 应用层统一重试次数(含简单退避)
+LLM_CONTEXT_TOKENS = env_int("LLM_CONTEXT_TOKENS", 60000)  # 估算上下文窗口(token)
 
 # ---- 素材 token 预算(反思/报告节点单次喂给模型的素材量) ----
 # P0-1 加固说明: 反思节点"先判断、后截断"——充足性判定阶段的素材预算不再是固定 30000
@@ -286,27 +287,13 @@ def _is_duplicate_material(entry: str, materials: List[str]) -> bool:
 
 
 # ============================ 小工具函数 ============================
-def _env_int(name: str, default: int) -> int:
-    """读取环境变量中的整数配置, 值非法/缺失时回退默认值(模块启动期常量用)。"""
-    try:
-        return int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_flag(name: str, default: bool = True) -> bool:
-    """解析开关型环境变量: 1/true/yes/on(忽略大小写)视为开启, 0/false/no/off 视为关闭。"""
-    raw = (os.getenv(name, "") or "").strip().lower()
-    if raw in ("1", "true", "yes", "on", "y", "t"):
-        return True
-    if raw in ("0", "false", "no", "off", "n", "f"):
-        return False
-    return default
-
+# 注: 环境变量解析已统一收敛到 core/config.py(env_str/env_int/env_float/env_flag,
+# 2026 重构 P1), 旧版本文件内的 _env_int/_env_flag 重复实现已删除; 本文件常量
+# 全部保留为模块级属性(测试可 monkeypatch), 仅数据源改为 core.config 解析函数。
 
 # 是否允许 Agent 调用代码沙盒工具(exec_python_code)。可运行"仅基于搜索/PDF 素材调研"的
 # 纯只读模式: .env 里设 ALLOW_CODE_EXEC=false 即可整体关闭沙盒代码执行(见 README FAQ)。
-ALLOW_CODE_EXEC = _env_flag("ALLOW_CODE_EXEC", True)
+ALLOW_CODE_EXEC = env_flag("ALLOW_CODE_EXEC", True)
 
 
 def build_llm() -> ChatOpenAI:

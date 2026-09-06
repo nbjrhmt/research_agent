@@ -24,6 +24,8 @@ ddgs(DuckDuckGo)+ 必应 RSS/HTML 抓取方案——抓取方案经常被反爬�
 import os
 import time
 
+from core.config import env_int, env_str  # 统一环境变量解析(2026 重构 P1)
+
 _BOCHA_DEFAULT_URL = "https://api.bocha.cn/v1/web-search"
 
 # 尽量自动加载项目根目录 .env(不覆盖已存在的环境变量)。
@@ -38,18 +40,8 @@ _USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 _FRESHNESS_OPTIONS = ("oneday", "oneweek", "onemonth", "oneyear", "nolimit")
 
-
-def _env_int(name: str, default: int) -> int:
-    """读取环境变量中的整数, 填错时退回默认值"""
-    try:
-        return int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_str(name: str, default: str) -> str:
-    """读取环境变量中的字符串, 空值退回默认值"""
-    return (os.getenv(name, "") or default).strip()
+# 注: 环境变量解析已统一收敛到 core/config.py(env_int/env_str, 2026 重构 P1),
+# 本文件旧版本各自实现的同名本地解析函数已删除, 与 graph_builder.py 共用同一出处。
 
 
 # ============================ 通用: 格式化结果 ============================
@@ -88,22 +80,22 @@ def bocha_web_search(query: str, max_results: int | None = None,
     if not query:
         return "【工具异常】bocha_web_search: 搜索关键词为空。"
 
-    api_key = _env_str("BOCHA_API_KEY", "")
+    api_key = env_str("BOCHA_API_KEY", "")
     if not api_key or api_key.startswith("你的"):
         return ("【工具异常】bocha_web_search: 未配置 BOCHA_API_KEY。请在项目根目录 .env 中填入"
                 "博查 API Key(申请地址 https://console.bochaai.com), 配置后刷新页面重试。")
-    base_url = _env_str("BOCHA_BASE_URL", _BOCHA_DEFAULT_URL)
-    timeout = timeout if timeout is not None else _env_int("SEARCH_TIMEOUT", 15)
+    base_url = env_str("BOCHA_BASE_URL", _BOCHA_DEFAULT_URL)
+    timeout = timeout if timeout is not None else env_int("SEARCH_TIMEOUT", 15)
 
     # 博查单次最多 10 条, count 超出上限会被服务端拒绝, 这里先钳制
-    count = max_results if max_results is not None else _env_int("BOCHA_COUNT", 5)
+    count = max_results if max_results is not None else env_int("BOCHA_COUNT", 5)
     try:
         count = max(1, min(int(count), 10))
     except (TypeError, ValueError):
         count = 5
 
     payload = {"query": query, "count": count, "summary": bool(summary)}
-    freshness = (freshness or _env_str("BOCHA_FRESHNESS", "noLimit")).strip().lower()
+    freshness = (freshness or env_str("BOCHA_FRESHNESS", "noLimit")).strip().lower()
     if freshness in _FRESHNESS_OPTIONS:
         payload["freshness"] = freshness
 

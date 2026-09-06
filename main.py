@@ -11,13 +11,32 @@ main.py —— 程序入口(Streamlit 网页界面)
 
 运行: streamlit run main.py
 """
-import json
 import os
-import re
 import time
 import uuid
 
 import streamlit as st
+
+# ---- 2026 工程重构 P1: 纯业务逻辑已迁入 core/(配置/历史持久化/临时文件/上传预读) ----
+# main.py 只保留 Streamlit UI 与事件编排; core 包不依赖 streamlit, 可独立 import 与单测。
+# 以下全部以"旧私有名"别名导入, 保证本文件既有调用点零改动。
+from core.file_store import (  # 上传落盘 / 清理 / 删除 / partial 快照 / 图表发现
+    cleanup_temp_files as _cleanup_temp_files,
+    delete_uploaded_files as _delete_uploaded_files,
+    find_new_images,
+    save_partial_run as _save_partial_run,
+    save_upload,
+)
+from core.history_store import (  # 历史 JSON 持久化 / 记录构造 / 文件名辅助
+    MAX_HISTORY,
+    clear_report_history_on_disk as _clear_report_history_on_disk,
+    clip_topic as _clip_topic,
+    load_report_history_from_disk as _load_report_history_from_disk,
+    new_report_record,
+    report_filename as _report_filename,
+    save_report_history_to_disk as _save_report_history_to_disk,
+)
+from core.ingest import ingest_upload as _ingest_upload  # 上传文件预读为素材
 
 from logging_setup import get_logger
 
@@ -28,155 +47,34 @@ _logger = get_logger("main")
 st.set_page_config(page_title="本地个人调研Agent", page_icon="🔎", layout="wide")
 
 # ============================ 📜 历史报告存储: 会话内存 + JSON 本地持久化 ============================
-# 存储策略(新增需求: 历史跨重启恢复):
+# 存储策略(与旧版完全一致, 实现已迁 core/history_store.py, 本文件只保留路径与内存态):
 #   1. 运行期历史保存在 st.session_state.report_history(会话内存), 供侧边栏选择/预览/下载;
 #   2. 每次新调研完成 / 点击【🗑️ 清空全部历史】时, 同步把完整列表覆盖写入根目录 report_history.json;
 #   3. main.py 启动(页面首次加载)时: 若 report_history.json 存在则读取恢复历史, 不存在则初始化为空列表;
 #   4. 容错: 文件缺失 / JSON 损坏 / IO 异常时只打印警告并降级为"纯内存模式", 程序照常运行, 不崩溃。
-# 已知限制: 单用户本地原型, report_history.json 中存放的是全部历史报告的完整文本。
-MAX_HISTORY = 20  # 历史报告最大保留条数: 超出自动丢弃最老记录, 防止内存/文件无限膨胀
+# 已知限制(沿用旧版): 单用户本地原型, report_history.json 中存放的是全部历史报告的完整文本。
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 项目根目录
 REPORT_HISTORY_FILE = os.path.join(BASE_DIR, "report_history.json")  # 历史报告持久化载体(仅此一个文件)
-
-
-def _load_report_history_from_disk() -> list:
-    """
-    启动时读取 report_history.json 恢复历史(仅首次加载页面/会话时调用一次)。
-    - 文件不存在 → 返回空列表(视为首次使用);
-    - 内容损坏 / 字段不完整 / IO 异常 → 打印警告并返回空列表, 降级纯内存模式, 不抛异常;
-    - 每条记录字段(id/topic/finished_at/file_stamp/report)原样复用, 不做任何改写;
-    - 只取前 MAX_HISTORY 条(文件按"新→旧"顺序存储), 与内存中的丢弃规则保持一致。
-    """
-    if not os.path.exists(REPORT_HISTORY_FILE):
-        return []
-    try:
-        with open(REPORT_HISTORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):   # 根节点必须是数组
-            raise ValueError("文件内容不是 JSON 数组")
-        valid = []
-        for rec in data:                 # 逐条校验: 缺字段 / 字段类型异常视为损坏, 丢弃
-            if isinstance(rec, dict) and all(
-                isinstance(rec.get(key), str) for key in
-                ("id", "topic", "finished_at", "file_stamp", "report")
-            ):
-                valid.append(rec)
-        return valid[:MAX_HISTORY]
-    except Exception as exc:  # noqa: BLE001 —— JSON 损坏 / 编码错误 / IO 异常等一律容错
-        _logger.warning("读取 %s 失败(%s: %s), 已降级为内存模式, 本次启动历史为空。",
-                        REPORT_HISTORY_FILE, type(exc).__name__, exc)
-        return []
-
-
-def _save_report_history_to_disk(history: list) -> None:
-    """
-    把当前完整 report_history 列表【覆盖】写入 report_history.json(每次变更后同步落盘)。
-    写入失败(磁盘只读 / 权限 / 编码等异常)只打印警告, 历史仍保留在内存, 程序继续运行。
-    """
-    try:
-        with open(REPORT_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning("写入 %s 失败(%s: %s), 历史仅保留在内存中, 重启后可能丢失。",
-                        REPORT_HISTORY_FILE, type(exc).__name__, exc)
-
-
-def _clear_report_history_on_disk() -> None:
-    """【清空全部历史】时同步清空 report_history.json(文件保留但内容为空数组)。"""
-    _save_report_history_to_disk([])
-
 
 if "report_history" not in st.session_state:
     # 每个元素的结构:
     # {"id": 唯一id, "topic": 调研主题, "finished_at": 完成时间,
     #  "file_stamp": 下载文件名时间戳(如 2026-09-02_192017), "report": 完整markdown报告文本}
-    st.session_state.report_history = _load_report_history_from_disk()  # 有 json 文件则恢复, 无则空列表
+    st.session_state.report_history = _load_report_history_from_disk(REPORT_HISTORY_FILE)  # 有 json 文件则恢复, 无则空列表
 
 TEMP_UPLOAD_DIR = os.path.join(BASE_DIR, "temp_upload")  # 上传文件/图表存放目录
 os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
 
 
 # ============================ 🧹 临时文件生命周期管理 ============================
-# 上传文件/图表/部分成果只增不减会持续占用磁盘, 这里统一管理:
+# 实现已迁入 core/file_store.py(2026 工程重构 P1), 行为与旧版完全一致:
 #   1) 应用启动(首个会话): 清空 temp_upload/ 残留(上一进程遗留的上传/图表/沙盒临时文件);
 #   2) 每次开始新调研前: 清理上一轮遗留文件, 但保留当前结果面板仍在引用的图表;
 #   3) 每次调研结束(成功/失败): 删除本次上传文件的磁盘副本(内容已进入素材/历史);
-# 说明: 当前 run 的图表要用于结果面板展示, 保留到下一次任务开始时再清理(最多保留两轮)。
-def _cleanup_temp_files(keep_files: list = None) -> None:
-    """清理 temp_upload/ 下可删除的临时文件; keep_files: 需保留的绝对路径列表。
-
-    删除失败只记日志, 不影响主流程; .sandbox_runs 子目录内的沙盒临时文件一并清理。
-
-    ★ 工程边界备注(并发竞争条件, 见 README「已知项目局限」): 本函数只适合"单进程
-      Streamlit"模式。若多进程/多实例共享同一 temp_upload/ 目录, 会出现清理竞争:
-      一个实例可能删除另一个实例刚生成/仍在使用的上传文件、partial_*.json 或图表
-      (先 listdir 后逐个删除, 期间无跨进程锁)。多实例部署前需改为按任务目录隔离
-      或引入互斥/引用计数, 当前版本不实现。
-    """
-    keep = set()
-    for p in keep_files or []:
-        try:
-            keep.add(os.path.normcase(os.path.abspath(str(p))))
-        except Exception:  # noqa: BLE001
-            pass
-    try:
-        for name in os.listdir(TEMP_UPLOAD_DIR):
-            item = os.path.join(TEMP_UPLOAD_DIR, name)
-            if os.path.isdir(item):
-                # 沙盒运行子目录: 只清内容, 目录保留(代码执行工具按需自建)
-                if name == ".sandbox_runs":
-                    for inner in os.listdir(item):
-                        try:
-                            os.remove(os.path.join(item, inner))
-                        except OSError as exc:
-                            _logger.warning("清理沙盒临时文件失败 %s: %s", inner, exc)
-                continue
-            if os.path.normcase(os.path.abspath(item)) in keep:
-                continue
-            try:
-                os.remove(item)
-            except OSError as exc:
-                _logger.warning("清理临时文件失败 %s: %s", item, exc)
-    except OSError as exc:
-        _logger.warning("清理 temp_upload/ 失败: %s", exc)
-
-
-def _delete_uploaded_files(fnames: list) -> None:
-    """调研结束后删除本次上传文件的磁盘副本(素材文本已在 State/历史中)。"""
-    for fname in fnames or []:
-        path = os.path.join(TEMP_UPLOAD_DIR, fname)
-        try:
-            if os.path.isfile(path):
-                os.remove(path)
-        except OSError as exc:
-            _logger.warning("删除本次上传文件副本失败 %s: %s", path, exc)
-
-
-def _save_partial_run(state_values: dict, error_text: str = "") -> str:
-    """任务异常兜底: 把已搜集素材(含上传文件预读素材)落盘为 partial JSON。
-
-    P0-4 要求: 任何异常路径(LLM 重试全失败 / 沙盒致命错误 / 搜索 API 报错 / 任务异常)
-    只要能取回素材就必须落盘并提供下载, 杜绝静默失败; 落盘失败会抛异常, 由调用方在 UI
-    明确提示"部分素材保存失败"(不掩盖原始任务错误)。
-    """
-    payload = {
-        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "note": "任务异常中断时自动保存的已搜集素材(partial 兜底), 可直接阅读或复制给新任务使用",
-        "error": error_text[:500] if error_text else "",
-        "user_query": state_values.get("user_query", ""),
-        "sub_tasks": state_values.get("sub_tasks") or [],
-        "iteration_count": state_values.get("iteration_count") or 0,
-        "collected_info": state_values.get("collected_info") or [],
-    }
-    fname = f"partial_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.json"
-    path = os.path.join(TEMP_UPLOAD_DIR, fname)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception as exc:  # noqa: BLE001 —— 落盘失败必须抛给调用方在 UI 显式提示
-        _logger.exception("保存部分成果失败: %s", exc)
-        raise
-    return path
+#   4) 任务异常兜底: 已搜集素材落盘 temp_upload/partial_*.json(_save_partial_run)。
+# 本文件只负责按上面时机调用(_cleanup_temp_files / _delete_uploaded_files /
+# _save_partial_run / find_new_images 均从 core.file_store 别名导入, 见文件顶部),
+# 具体逻辑与"单进程工程边界备注"见 core/file_store.py。
 
 
 if "temp_boot_cleanup_done" not in st.session_state:
@@ -211,61 +109,11 @@ MAX_FILE_SIZE_MB = 30  # 单个上传文件大小上限
 
 
 # ============================ 上传文件相关 ============================
-def _save_upload(uploaded_file) -> str:
-    """把上传文件保存到 temp_upload/, 返回带随机前缀的落盘文件名"""
-    safe_name = re.sub(r"[^\w.\-]", "_", uploaded_file.name)   # 去掉不安全字符
-    fname = f"{time.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{safe_name}"
-    path = os.path.join(TEMP_UPLOAD_DIR, fname)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return fname
-
-
-def _preview_csv(file_path: str, head_rows: int = 20, max_chars: int = 10000) -> str:
-    """读取 CSV 并生成文本预览素材(兼容常见中文编码)"""
-    import pandas as pd
-
-    df = None
-    errors = []
-    for encoding in ("utf-8", "utf-8-sig", "gbk", "gb18030", "latin1"):
-        try:
-            df = pd.read_csv(file_path, encoding=encoding)
-            break
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{encoding}: {exc}")
-    if df is None:
-        return f"【工具异常】CSV 读取失败(编码/格式无法识别): {errors[0] if errors else '未知错误'}"
-    if df.shape[1] == 0 or df.shape[0] == 0:
-        return "【提示】CSV 内容是空的(0 行 0 列)。"
-
-    lines = [
-        f"行数: {len(df)}  |  列数: {df.shape[1]}",
-        f"列名: {', '.join(str(c) for c in df.columns)}",
-        f"前 {head_rows} 行预览(用于了解字段结构):",
-    ]
-    lines.append(df.head(head_rows).to_string(index=False, max_colwidth=40))
-    text = "\n".join(lines)
-    if len(text) > max_chars:
-        text = text[:max_chars] + f"\n……(预览过长, 仅展示前 {max_chars} 字符)"
-    return text
-
-
-def _ingest_upload(fname: str):
-    """
-    任务开始前自动预读上传文件 → 返回 (素材条目, 日志行)。
-    PDF 提取全文; CSV 给出结构预览(更深入的分析由工具节点用 exec_python_code 完成)。
-    """
-    path = os.path.join(TEMP_UPLOAD_DIR, fname)
-    ext = os.path.splitext(fname)[1].lower()
-    if ext == ".pdf":
-        from tools.pdf_reader import read_pdf
-
-        text = read_pdf(fname)
-        return f"【素材-上传PDF】文件: {fname}\n{text}", f"已自动预读上传的 PDF: {fname}"
-    if ext == ".csv":
-        text = _preview_csv(path)
-        return f"【素材-上传CSV预览】文件: {fname}\n{text}", f"已自动预读上传的 CSV: {fname}(结构预览见素材)"
-    return "", f"跳过不支持的文件类型: {fname}(仅支持 PDF / CSV)"
+# 实现已迁入 core/(2026 工程重构 P1):
+#   _save_upload    → core.file_store.save_upload(data, original_name)
+#   _preview_csv    → core.ingest.preview_csv(file_path)
+#   _ingest_upload  → core.ingest.ingest_upload(fname)(本文件顶部别名 _ingest_upload)
+# 本文件只保留上传大小校验与页面交互逻辑。
 
 
 # ============================ 图执行与实时日志 ============================
@@ -428,39 +276,15 @@ def _render_graph_run(user_query: str, fnames: list):
 
     progress_bar.empty()
 
-    # ---- 收集本轮生成的图表图片 ----
-    new_images = []
-    try:
-        for name in sorted(os.listdir(TEMP_UPLOAD_DIR)):
-            if name.lower().endswith((".png", ".jpg", ".jpeg")):
-                img_path = os.path.join(TEMP_UPLOAD_DIR, name)
-                if os.path.getmtime(img_path) >= run_started_at - 2:
-                    new_images.append(img_path)
-    except OSError:
-        pass
+    # ---- 收集本轮生成的图表图片(实现见 core.file_store.find_new_images) ----
+    new_images = find_new_images(TEMP_UPLOAD_DIR, run_started_at)
 
     return final_report, max_round, total_materials, new_images
 
 
-# ============================ 📜 历史报告相关辅助函数(内存 + json 文件) ============================
-def _clip_topic(topic: str, max_len: int = 25) -> str:
-    """截断主题用于下拉框展示: 主题最多保留 max_len 个字符, 超出加省略号"""
-    topic = (topic or "").strip()
-    if not topic:
-        return "(空主题)"
-    return topic if len(topic) <= max_len else topic[:max_len] + "…"
-
-
-def _safe_filename_part(text: str, max_len: int = 40) -> str:
-    """把主题加工成安全的下载文件名主干: 仅剔除 Windows/Unix 文件名非法字符, 保留中文"""
-    part = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text).strip(" ._")
-    part = re.sub(r"_+", "_", part)   # 合并连续下划线
-    return (part[:max_len].rstrip(" ._")) or "report"
-
-
-def _report_filename(record: dict) -> str:
-    """生成下载文件名, 格式示例: 2026-09-02_192017_2026年国内开源大模型最新进展对比.md"""
-    return f"{record['file_stamp']}_{_safe_filename_part(record['topic'])}.md"
+# ============================ 📜 历史记录辅助(实现见 core/history_store.py) ============================
+# _clip_topic / _safe_filename_part / _report_filename / new_report_record / MAX_HISTORY
+# 均从 core.history_store 别名导入(见文件顶部), 字段与文件名格式与旧版完全一致。
 
 
 def _save_report_to_history(topic: str, report: str) -> None:
@@ -468,22 +292,17 @@ def _save_report_to_history(topic: str, report: str) -> None:
 
     - 新报告插入列表最顶部(索引0);
     - 最多保留 MAX_HISTORY(20) 条, 超出自动丢弃最老的记录(内存与 json 文件保持一致);
-    - 落盘(写入 report_history.json)失败只打印警告, 降级为纯内存模式, 不影响本轮结果。
+    - 落盘(写入 report_history.json)失败只打印警告, 降级为纯内存模式, 不影响本轮结果;
+    - 记录构造(new_report_record)与落盘(_save_report_history_to_disk)实现在 core/history_store.py。
     """
     if not (report or "").strip():
         return  # 未生成有效报告文本时不入历史
-    finished_at = time.strftime("%Y-%m-%d %H:%M:%S")   # 展示用完成时间, 与结果面板同格式
-    record = {
-        "id": uuid.uuid4().hex[:10],        # 唯一 id, 供下拉框稳定定位记录
-        "topic": topic,
-        "finished_at": finished_at,
-        "file_stamp": finished_at[:10] + "_" + finished_at[11:].replace(":", ""),  # 2026-09-02_192017
-        "report": report,                   # 完整 markdown 报告文本
-    }
+    record = new_report_record(topic, report)
     history = st.session_state.setdefault("report_history", [])
     history.insert(0, record)    # 新报告插入列表最顶部
     del history[MAX_HISTORY:]    # 超过 20 条自动丢弃最老记录
-    _save_report_history_to_disk(history)   # 同步把完整列表覆盖写回 report_history.json(本地持久化)
+    # 同步把完整列表覆盖写回 report_history.json(本地持久化)
+    _save_report_history_to_disk(history, REPORT_HISTORY_FILE)
 
 
 # ============================ 页面 ============================
@@ -605,7 +424,7 @@ if start_clicked:
                 st.warning(f"跳过超大文件: {up.name}(>{MAX_FILE_SIZE_MB}MB)")
                 continue
             try:
-                fnames.append(_save_upload(up))
+                fnames.append(save_upload(up.getbuffer(), up.name))
             except OSError as exc:
                 st.error(f"保存上传文件 {up.name} 失败(磁盘/权限问题): {exc}, 该文件将被跳过")
 

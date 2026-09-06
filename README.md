@@ -4,16 +4,18 @@
 
 > 一个把 **LLM 大模型 + 任务规划 + 多轮反思迭代 + 联网搜索 + 工具调用** 串起来的本地调研 Agent 个人实践项目。
 
-> 🚨 **安全与部署边界声明 —— 先读这里, 不要跳过**
->
-> 本项目自带的 **代码沙盒不是生产级安全沙箱**:
-> - 静态黑名单**只是简单的文本字面拦截**, 可被字符串拼接、`exec`/`eval`、动态 `import`、变量别名等手段绕过;
-> - 缺少 **CPU / 内存 / fork 炸弹等资源限制**, 恶意或写坏的代码仍可能拖垮运行机器;
-> - 所有用户代码运行在**同一个 UID/账户**下, 仅靠目录隔离(temp_upload/)受限执行, 不是进程级强隔离;
-> - 因此:**禁止公网 / 多租户对外部署**, 本项目仅可用于 **内部演示、本地个人使用**;
-> - 页面上传、历史 JSON、日志等也均未做多用户隔离与鉴权, 请勿暴露在不受信任的网络中。
->
-> 全部限制细节见 [§8 已知项目局限](#8-已知项目局限如实说明)。
+**⚡ 核心特性速览(2026.09 重构版 v1.4.0)**
+
+- 🤖 **LangGraph 状态机编排**: 规划 → 工具调用 → 反思 → 再搜集/报告的**多轮自主迭代闭环**(反思结构化判定 + 轮次/失败双上限收敛, 不依赖自由文本路由);
+- 🛠 **三类工具 + 双层沙盒**: 博查联网搜索 / PDF 解析 / 受限代码执行(静态黑名单 → 子进程隔离 → 运行时真实路径白名单 → 超时强杀);
+- 📐 **引擎与 UI 分层**: `core/` 核心服务层(config / history_store / file_store / ingest)与 Streamlit 界面解耦, 纯逻辑不依赖 UI、可独立单测;
+- 📝 **防幻觉与上下文治理**: 报告结论强制标注【素材N】+ 来源 URL; tiktoken 真实预算 + 反思"先判断、后截断";
+- 🧪 **工程质量**: **113 条离线单测**(零 API 消耗, CI 自动执行)+ pytest-cov 覆盖率(core 层 ≈94%)+ ruff + 依赖锁一致性校验;
+- 🚀 **可部署**: Dockerfile 一键容器化(密钥环境变量注入、不打包 .env)+ Streamlit 默认配置开箱即用。
+
+> ⚠️ **定位与安全边界(一句话)**: 单用户本地原型项目, 自带代码沙盒**非生产级安全沙箱**——仅限本机/可信内网演示使用, **禁止公网 / 多租户部署**; 完整声明见 [§8 已知项目局限](#8-已知项目局限如实说明)。
+
+**📑 目录**: [1 项目简介](#1-项目简介) · [2 架构设计](#2-项目架构设计) · [3 核心难点](#3-项目核心难点与技术突破) · [4 环境依赖](#4-环境依赖) · [5 部署与运行](#5-部署--运行步骤) · [6 运行示例](#6-运行示例用例) · [7 功能特性](#7-功能特性) · [8 已知局限](#8-已知项目局限如实说明) · [9 目录说明](#9-项目文件目录说明) · [10 FAQ](#10-常见问题-faq--故障排查) · [11 升级指南](#11-老用户升级迁移指南从旧版本升级) · [12 License](#12-开源-license) · [13 简历提示](#13-简历提示) · [14 简历项目简介](#14-简历项目简介直接复制版)
 
 ## 1. 项目简介
 
@@ -45,8 +47,11 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ L0 展示层        main.py(Streamlit)                                        │
-│                  输入主题/上传 PDF·CSV → 逐节点实时日志 → 报告/图表/历史/下载     │
+│ L0 展示层        main.py(Streamlit UI 壳, 2026 P1 重构)                       │
+│                  页面布局/事件编排/实时日志渲染/历史面板(纯业务逻辑已下放 core)      │
+├──────────────────────────────────────────────────────────────────────────┤
+│ L0.5 核心服务层 core/: config · history_store · file_store · ingest │
+│               纯逻辑, 无 Streamlit 依赖, 可独立单测; UI 只 import 调用 │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ L1 调度编排层    LangGraph StateGraph(graph_builder.py · state_schema.py)   │
 │                  planner → tool ⇄ reflection → report                      │
@@ -119,6 +124,7 @@
 | L3 | `bocha_web_search` / `read_pdf` / `_ingest_upload` | 三种素材源, 失败均返回【工具异常】文本素材而非抛断流程 |
 | L6 | `_save_partial_run` / `_salvage_run_materials` | 异常快照落盘 + 双源素材取回(快照优先, 本地追踪兜底) |
 | L6 | `logging_setup` / `_load_report_history_*` / `_cleanup_temp_files` | 日志/历史/临时文件三套生命周期管理 |
+| L0.5 | `core/config` `core/history_store` `core/file_store` `core/ingest` | 2026 P1 重构: 配置解析/历史持久化/临时文件/上传预读收敛为**无 UI 依赖的核心服务层**(面试口径: 引擎与界面解耦, 逻辑可独立单测、可被 CLI/API 复用) |
 
 ## 3. 项目核心难点与技术突破
 
@@ -167,7 +173,7 @@
    【工具异常】素材如实进入报告"资料获取情况"章节。收益: 迭代一定终止、结论可逐条溯源。
 
 6. **工程自动化: 双 CI + 全量离线单测体系, 质量门禁前置**
-   e2e 会真实消耗 LLM/搜索 API, 不适合 CI 频繁执行。方案: 建立 **46 条全离线 pytest 用例**
+   e2e 会真实消耗 LLM/搜索 API, 不适合 CI 频繁执行。方案: 建立 **113 条全离线 pytest 用例(2026 P2 扩至 core/tools 层)**
    (注入假 LLM/假搜索, 零 API 消耗), 用 `pytest.ini` 只收集 `test_*.py` 把耗额度测试隔离在 CI 外;
    GitHub Actions 与 GitLab CI 双平台等价流水线(离线单测 → ruff lint → 锁文件一致性校验,
    由 `scripts/check_lock_consistency.py` 无网络校验 requirements.txt 与 lock 文件约束);
@@ -232,6 +238,26 @@ copy .env.example .env
 # ④ 启动应用(默认地址 http://localhost:8501)
 streamlit run main.py
 ```
+
+### 5.1 Docker 部署(可选, 2026 P3 新增)
+
+> 镜像**不打包 .env / API Key**(构建层与运行层均不落盘密钥), 密钥通过环境变量注入;
+> 安全边界同顶部声明——仅限本机/可信内网, 禁止公网部署。
+
+```bash
+# 构建(镜像名建议带版本号, 与 pyproject/CHANGELOG 的 1.4.0 对齐)
+docker build -t research-agent:1.4.0 .
+
+# 运行方式一: 逐项环境变量注入
+docker run -d --name research-agent -p 8501:8501   -e OPENAI_API_KEY=sk-xxx   -e OPENAI_BASE_URL=https://api.deepseek.com/v1   -e LLM_MODEL=deepseek-chat   -e BOCHA_API_KEY=sk-xxx   research-agent:1.4.0
+
+# 运行方式二: --env-file 注入(注意 .env 不要提交到仓库/打入镜像)
+docker run -d --name research-agent -p 8501:8501 --env-file .env research-agent:1.4.0
+```
+
+- 容器内默认 `127.0.0.1:8501` 映射到宿主 `localhost:8501`, 浏览器访问 `http://localhost:8501`;
+- 需要持久化历史/素材时挂载 volume: `-v research_data:/app/temp_upload`(report_history.json 位于 /app 根, 可按需另行挂载);
+- 镜像以非 root 用户(uid 1000)运行; 完整说明见 [Dockerfile](Dockerfile) 头注释与 [.dockerignore](.dockerignore)。
 
 ### `.env` 配置示例(复制 `.env.example` 后填写)
 
@@ -304,10 +330,20 @@ BOCHA_API_KEY=sk-你的博查API_Key
 - **历史报告本地持久化**: 完成的报告自动存入侧边栏历史并写入 `report_history.json`; 关闭浏览器 / 重启 streamlit 后历史自动恢复; 最多保留 20 条, 超出自动丢弃最老记录;
 - **临时文件自动清理**: 上传文件/图表按任务周期自动清理(`temp_upload/` 不无限膨胀);
 - **全异常路径素材兜底(不静默失败)**: LLM 重试全部失败 / 沙盒致命错误 / 搜索 API 报错 / 任务运行异常等任一异常, 已搜集素材(含上传预读素材)都会落盘 `temp_upload/partial_*.json` 并在页面给出提示 + 下载按钮; 无素材时也明确提示;
-- **离线单测 + CI**: 46 条 pytest 离线用例(不调用 LLM/搜索 API)覆盖沙盒、token 裁剪/预算、反思解析、去重等核心逻辑; GitHub Actions 与 GitLab CI 自动跑测试 / ruff lint / 锁文件一致性(见 §9);
+- **离线单测 + CI**: 113 条 pytest 离线用例(不调用 LLM/搜索 API), 覆盖沙盒、token 裁剪/预算、反思解析、素材去重(原有 46 条)+ 2026 P2 新增的 core 层(统一配置/历史持久化/临时文件/上传预读)、search_tool 格式化、pdf_reader 离线分支等 67 条; 本地 pytest-cov 度量: core 层约 94%、graph_builder 88%、整体约 78%(沙盒子进程运行器在子进程执行, 不计入统计, 命令见 §11.4); GitHub Actions 与 GitLab CI 自动跑测试 / ruff lint / 锁文件一致性(见 §9);
 - **统一日志**: 标准 logging 模块输出到 `logs/app.log`(带时间戳/级别/异常堆栈, 自动轮转; 仅限单进程模式, 见 §8)。
 
 ## 8. 已知项目局限(如实说明)
+
+> 🚨 **安全与部署边界声明(完整版, 从 README 顶部移入)**
+>
+> 本项目自带的 **代码沙盒不是生产级安全沙箱**:
+> - 静态黑名单**只是简单的文本字面拦截**, 可被字符串拼接、`exec`/`eval`、动态 `import`、变量别名等手段绕过;
+> - 缺少 **CPU / 内存 / fork 炸弹等资源限制**, 恶意或写坏的代码仍可能拖垮运行机器;
+> - 所有用户代码运行在**同一个 UID/账户**下, 仅靠目录隔离(temp_upload/)受限执行, 不是进程级强隔离;
+> - 因此:**禁止公网 / 多租户对外部署**, 本项目仅可用于 **内部演示、本地个人使用**;
+> - 页面上传、历史 JSON、日志等也均未做多用户隔离与鉴权, 请勿暴露在不受信任的网络中;
+> - Docker 镜像同理仅限可信环境(见 §5.1), 不要暴露到公网。
 
 - 🧑‍💻 **单用户本地原型**: 只考虑个人在本地使用, 未做多用户 / 多会话隔离;
 - 🔑 **无用户认证**: 任何能访问到页面端口的人都能直接操作, 切勿直接暴露到公网;
@@ -328,13 +364,24 @@ BOCHA_API_KEY=sk-你的博查API_Key
 
 ```
 research_agent/
-├── main.py                  # Streamlit 入口: 页面布局、上传文件预读、实时日志渲染、
-│                            #   历史面板、临时文件清理、全异常路径素材落盘兜底、统一日志
+├── main.py                  # Streamlit UI 壳(2026 P1 重构): 页面布局/输入上传交互/实时
+│                            #   日志渲染/历史面板/异常兜底展示; 纯业务逻辑已迁入 core/
 ├── graph_builder.py         # LangGraph 图: State 图构建、四个节点(规划/工具/反思/报告)、
 │                            #   结构化反思判定(先判断后截断 + 失败内部重试防空转)、token 预算
 ├── state_schema.py          # Agent State 数据结构(TypedDict, 含 reflection_sufficient /
 │                            #   reflection_failures 等判定与内部字段)
 ├── logging_setup.py         # 统一日志配置(logs/app.log, 时间戳 + 异常堆栈落盘)
+├── core/                     # 核心服务层(2026 P1 重构, 纯逻辑、不依赖 Streamlit):
+│   ├── __init__.py           #   包说明与模块索引
+│   ├── config.py             #   统一环境变量解析(env_str/env_int/env_float/env_flag, 全库唯一出处)
+│   ├── history_store.py      #   报告历史 JSON 持久化(容错读写 / 记录构造 / 下载文件名)
+│   ├── file_store.py         #   临时文件生命周期(上传落盘 / 清理 / partial 快照 / 图表发现)
+│   └── ingest.py             #   上传文件预读为素材(PDF 全文 / CSV 多编码结构预览)
+├── .streamlit/config.toml    # Streamlit 默认配置(headless / 监听地址 / 端口 / 主题)
+├── Dockerfile                # 容器镜像: 非 root 运行, 不打包 .env, 密钥环境变量注入
+├── .dockerignore             # 构建上下文排除(密钥 / 缓存 / 测试 / 本地数据)
+├── pyproject.toml            # 项目元数据 + ruff 配置落位(pip install -e . 开发安装)
+├── LICENSE                   # MIT 许可证(2026 P4)
 ├── requirements.txt         # Python 依赖清单(下限约束)
 ├── requirements-lock.txt    # pip-tools 生成的精确版本锁定(可复现安装; CI 校验其一致性)
 ├── CHANGELOG.md             # 版本变更记录(P0/P1/P2 计划与工程备注, 迭代追溯用)
@@ -358,11 +405,18 @@ research_agent/
 │   ├── code_exec_tool.py    #   代码沙盒入口(文本黑名单 + 静态预检 + 子进程调度/超时强杀)
 │   └── _sandbox_runner.py   #   代码沙盒子进程运行器(受限内置函数 + 真实路径白名单)
 ├── memory/                  # ChromaDB 长期记忆模块(预留, 当前未接入主流程)
-├── tests/                   # 离线单元测试(pytest, 不调用 LLM/搜索 API, CI 自动执行):
+├── tests/                   # 离线单元测试(pytest, 不调用 LLM/搜索 API, CI 自动执行, 共 113 条):
+│   ├── conftest.py          #   路径引导 + workdir 临时目录 fixture(2026 P2/P4 新增)
 │   ├── test_graph_builder.py#   graph_builder 核心单测: token 裁剪/预算告警、反思 JSON 解析
 │   │                        #   与时序、素材去重、规划/报告/路由(31 条)
 │   ├── test_sandbox.py      #   代码沙盒回归: 黑名单/运行时路径白名单/超时强杀/图表/模板(15 条)
 │   │                        #   运行: python -m pytest tests  或  python tests/test_sandbox.py
+│   ├── test_config.py       #   core/config 统一配置解析(15 条, 2026 P2 新增)
+│   ├── test_history_store.py#   core/history_store 历史持久化容错与记录构造(14 条, 2026 P2 新增)
+│   ├── test_file_store.py   #   core/file_store 临时文件/partial 快照/图表发现(10 条, 2026 P2 新增)
+│   ├── test_ingest.py       #   core/ingest 上传预读: CSV 多编码/PDF/非法类型(8 条, 2026 P2 新增)
+│   ├── test_pdf_reader.py   #   tools/pdf_reader 离线分支(7 条, 2026 P2 新增)
+│   ├── test_search_formatting.py  # tools/search_tool 格式化/参数/错误分支(13 条, 2026 P2 新增)
 │   ├── test_search.py       #   ⚠️ 联网冒烟(真实调用博查 API, 手动运行, 不进 CI)
 │   └── _e2e_test.py         #   ⚠️ 全链路测试(真实消耗 LLM + 博查 API 额度, 手动运行, 不进 CI!)
 │                            #   (python tests/_e2e_test.py; 异常时自动保留已搜集素材)
@@ -385,7 +439,7 @@ research_agent/
 | `logging_setup.py` | 统一日志(logs/app.log: 时间戳 + 级别 + 异常堆栈, RotatingFileHandler 轮转; 仅单进程模式) |
 | `tools/*` | 三类工具: 联网搜索、PDF 读取、代码沙盒 —— 全部"只产出素材文本"; 沙盒为子进程 + 路径白名单 + 超时强杀(非生产级, 见顶部安全声明) |
 | `prompts/*` | 全部节点提示词模板(系统 + 用户), 与代码分离, 方便单独调整(升级时保持目录完整, 见 §11) |
-| `tests/test_graph_builder.py` `tests/test_sandbox.py` | **离线单元测试(pytest, 不调用 API)**: token 裁剪/预算告警、反思解析与时序、素材去重、沙盒回归等; `python -m pytest tests` |
+| `tests/`(共 113 条) | **离线单元测试(pytest, 不调用 API)**: 沙盒回归、token 预算、反思解析与时序、素材去重、core 层(配置/历史/文件/预读)、search 格式化、pdf 分支; `python -m pytest tests`; 覆盖率命令见 §11.4 |
 | `tests/_e2e_test.py` `tests/test_search.py` | ⚠️ **真实消耗 LLM / 博查 API 额度的联网测试, 手动运行、不进 CI**(见 FAQ Q11) |
 | `scripts/*` | export_md(历史导出 .md)、check_lock_consistency(CI 锁文件一致性校验) |
 | `pytest.ini` `.github/workflows/ci.yml` `.gitlab-ci.yml` `CHANGELOG.md` | 测试配置 / 双平台 CI(测试 + lint + 锁校验)/ 版本变更记录 |
@@ -401,8 +455,10 @@ research_agent/
   不在函数内散落魔法数字(轮次/预算/超时等均有具名常量);
 - **分层规范**: 节点/工具只通过 State 与"素材文本"交互, 不互相 import 调用; 每个工具
   "只产出素材文本、不直接写报告"; 提示词抽离 `prompts/*.txt`, 与代码解耦;
-- **质量门禁**: 全库通过 `ruff check`(E4/E7/E9/F, `noqa` 必须带原因注释); 离线单测不依赖
-  网络与密钥; CI 覆盖测试 / lint / 锁一致性三项。
+- **质量门禁**: 全库通过 `ruff check`(E4/E7/E9/F, `noqa` 必须带原因注释); **113 条**离线单测
+  不依赖网络与密钥(2026 P2 新增 67 条 core/tools 层用例); 本地 pytest-cov 覆盖率: core 层
+  约 94%(config/history_store/ingest/pdf_reader 100%)、graph_builder 88%、整体约 78%
+  (沙盒子进程运行器 _sandbox_runner 于子进程执行, 不计入统计); CI 覆盖测试 / lint / 锁一致性三项。
 
 ## 10. 常见问题 FAQ / 故障排查
 
@@ -443,7 +499,7 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 ① 工具提示词会明确告知模型禁止选择 `exec_python_code`; ② 即使模型仍选择该工具, 也会被拦截并返回"已被管理员关闭"的素材说明, **不会执行任何代码**; ③ 侧边栏安全边界显示"代码沙盒: 已整体关闭"。适合只想做"联网检索 + PDF 阅读"纯只读调研的场景。
 
 **Q11: `tests/_e2e_test.py` / `tests/test_search.py` 会消耗真实 API 额度吗?**
-→ ⚠️ **会, 而且是高额风险点**——它们会真实调用 LLM(推理费用)与博查搜索 API(次数费用): 每次跑通 e2e 约 2~10 次接口调用。**执行前务必确认 `.env` 里的密钥有效且有充足额度**, 建议先查账单/额度; CI 不运行这两个文件, 日常验证请用 `python -m pytest tests`(46 条离线用例, 零 API 消耗)。
+→ ⚠️ **会, 而且是高额风险点**——它们会真实调用 LLM(推理费用)与博查搜索 API(次数费用): 每次跑通 e2e 约 2~10 次接口调用。**执行前务必确认 `.env` 里的密钥有效且有充足额度**, 建议先查账单/额度; CI 不运行这两个文件, 日常验证请用 `python -m pytest tests`(113 条离线用例, 零 API 消耗)。
 
 **Q12: 任务异常后 partial_*.json 素材文件什么时候会被删除?**
 → 页面提示下载后请尽快保存; 下一次开始新任务时会触发 `temp_upload/` 自动清理, 删除旧的 partial 文件(见 §8 工程边界备注)。历史报告则在 `report_history.json`, 不受影响。
@@ -491,14 +547,17 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 
 ### 11.4 离线测试 & CI(开发者)
 
-- 本地: `python -m pytest tests`(46 条, 不消耗 API); lint: `ruff check .`;
+- 本地: `python -m pytest tests`(113 条, 不消耗 API); lint: `ruff check .`;
+- 覆盖率(本地度量, 可选): `pip install pytest-cov` 后执行
+  `python -m pytest tests --cov=core --cov=tools --cov=graph_builder --cov-report=term-missing`;
 - 提交前保证 `python scripts/check_lock_consistency.py` 通过(锁文件一致);
 - 若在 GitHub / GitLab 上启用 CI, 无需额外配置即可自动执行(见 §9)。
 
 ## 12. 开源 License
 
-> 📄 **License 说明(占位)**: 本仓库目前**尚未选择开源许可证**, 默认保留所有权利 —— 仅可查看与本地学习, 未经作者许可不得分发、修改后商用或对外提供。
-> 若你 Fork 后希望开源发布, 请自行补充许可证文件(如 MIT / Apache-2.0)并删除本占位说明。
+本项目采用 [MIT License](LICENSE)(Copyright (c) 2026 nbjrhmt, 2026 P4 起正式开源):
+可自由使用、修改、分发(含商用), 需保留版权声明; Fork 修改后对外发布时建议保留原作者署名。
+如需更换为 Apache-2.0 等其他许可证, 直接替换 LICENSE 文件并同步本段说明即可。
 
 ## 13. 简历提示
 
@@ -508,7 +567,9 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 - 解决 LLM 输出的关键工程问题: **结构化输出(JSON)约束与失败重试**、**真实 token 预算管理(tiktoken)与上下文防溢出**、**结构化反思判定(替代关键词匹配)**、**防幻觉(报告只依据素材、结论强制标注来源)**;
 - 通过 **Tool Use 模式** 接入联网搜索(博查 API)、PDF 解析、**受限 Python 代码沙盒(子进程隔离 + 真实路径白名单 + 超时强杀)**, 体现 Agent 工具安全工程能力;
 - 用 **Streamlit 构建可交互演示**, 含逐节点实时日志、图表展示、报告下载与 **本地持久化历史**、checkpointer 异常兜底、统一日志 —— 完整的前后端闭环;
-- 代码注释规范、模块划分清晰(入口 / 图构建 / 状态 / 工具 / 提示词 / 日志分离), 适合在面试中快速讲清系统架构与每一处设计取舍。
+- 代码注释规范、模块划分清晰(入口 / 图构建 / 状态 / 工具 / 提示词 / 日志分离), 适合在面试中快速讲清系统架构与每一处设计取舍;
+- 2026 P1/P3 重构加分点: **core 引擎层与 UI 解耦**(无 Streamlit 依赖的纯逻辑服务层, 可独立单测/复用)、pyproject 工程化、Docker 容器化(密钥不入镜像);
+- 测试体系可量化: **113 条离线单测**(46 条图/沙盒 + 67 条 core/tools 层)、core 层覆盖率约 94%、pytest-cov 接入方式可现场演示。
 
 > 如实描述为"个人实践原型"即可: 亮点在于亲手把 LLM + Agent 编排 + 工具调用 + Web 界面完整打通, 并做了不少真实工程化细节(重试、限轮、超时、token 预算、沙盒加固、防编造、日志、兜底)。
 
@@ -521,18 +582,18 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 
 > **本地 AI 调研 Agent(LangGraph + Streamlit)[个人项目]**
 >
-> 多轮自主迭代的 AI Agent: 输入主题自动完成"规划子任务 → 搜索/PDF/受限代码执行 → 反思评估 → 报告生成"闭环, 结论标注素材来源。工程亮点: 双层沙盒(静态拦截 + 运行时路径白名单 + 超时强杀); LLM 超时/解析失败重试容错; tiktoken 素材预算 + 反思"先判断后截断"; 全异常路径素材快照落盘; 46 条离线单测 + 双 CI。
+> 多轮自主迭代的 AI Agent: 输入主题自动完成"规划子任务 → 搜索/PDF/受限代码执行 → 反思评估 → 报告生成"闭环, 结论标注素材来源。工程亮点: 双层沙盒(静态拦截 + 运行时路径白名单 + 超时强杀); LLM 超时/解析失败重试容错; tiktoken 素材预算 + 反思"先判断后截断"; 全异常路径素材快照落盘; 113 条离线单测(覆盖率 core≈94%) + 双 CI + Docker 部署。
 
 ### 14.2 详细版(约 300 字)
 
 > **本地 AI 调研 Agent(LangGraph + Streamlit)[个人项目]**
 >
-> 基于 LangGraph 状态机实现多轮自主迭代的 AI 调研 Agent: 编排"规划 → 工具调用 → 反思评估 → 再搜集/出报告"闭环, 反思节点以结构化 JSON 判定信息充足性并给出下轮检索词, 报告强制标注【素材N】与来源 URL 防幻觉。工程亮点: ① 双层沙盒: 静态黑名单叠加子进程受限命名空间、运行时真实路径白名单与 30s 超时强杀, 阻断越权读密钥与死循环残留; ② LLM 统一容错: 指数退避重试、JSON 解析失败附错重试、反思连续失败防空转, 降低无效 API 消耗; ③ tiktoken 素材预算与判断信封动态扩容, 以"先判断后截断"消除素材截断误判; ④ 全异常路径素材快照落盘并支持 UI 下载。配套 46 条离线单测、GitHub/GitLab 双 CI 与依赖锁一致性校验。
+> 基于 LangGraph 状态机实现多轮自主迭代的 AI 调研 Agent: 编排"规划 → 工具调用 → 反思评估 → 再搜集/出报告"闭环, 反思节点以结构化 JSON 判定信息充足性并给出下轮检索词, 报告强制标注【素材N】与来源 URL 防幻觉。工程亮点: ① 双层沙盒: 静态黑名单叠加子进程受限命名空间、运行时真实路径白名单与 30s 超时强杀, 阻断越权读密钥与死循环残留; ② LLM 统一容错: 指数退避重试、JSON 解析失败附错重试、反思连续失败防空转, 降低无效 API 消耗; ③ tiktoken 素材预算与判断信封动态扩容, 以"先判断后截断"消除素材截断误判; ④ 全异常路径素材快照落盘并支持 UI 下载。配套 113 条离线单测(2026 年扩至 core/tools 层, core 覆盖率≈94%)、GitHub/GitLab 双 CI、依赖锁一致性校验与 Docker 容器化部署(密钥不入镜像)。
 
 ### 14.3 使用提示
 
-- 两条简介的数字(轮次上限 10、单测 46 条、双 CI)与仓库现状一致, 面试被追问时可到对应
+- 两条简介的数字(轮次上限 10、单测 113 条、双 CI、core 覆盖率≈94%)与仓库现状一致, 面试被追问时可到对应
   代码/测试中现场展开(推荐按 §2 架构 → §3 技术难点 → 代码注释的顺序讲解);
-- 若简历字数受限, 优先保留"多轮自主迭代 / LLM 容错 / 双层沙盒 / 素材快照兜底 / 46 条单测 + 双 CI";
+- 若简历字数受限, 优先保留"多轮自主迭代 / LLM 容错 / 双层沙盒 / 素材快照兜底 / 113 条单测 + 双 CI";
 - 面试高频追问已在本仓库可查证: 沙盒为何不是生产级(§8/代码注释)、InMemorySaver 为何重启丢状态
   (§8)、为什么反思先判断后截断(§3 第 3 条 + `test_graph_builder.py`)、CI 为什么不含 e2e(FAQ Q11)。

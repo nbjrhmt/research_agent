@@ -13,15 +13,10 @@ tests/test_graph_builder.py —— graph_builder 核心逻辑离线单元测试(
 适合 CI 频繁执行; 真实全链路(e2e, 消耗 API 额度)在 tests/_e2e_test.py, 不进 CI。
 """
 import json
-import os
-import sys
 
 import pytest
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
+# 项目根目录路径由 tests/conftest.py 统一注入(2026 工程重构 P4), 本文件不再自插 sys.path
 import graph_builder as gb  # noqa: E402
 from graph_builder import (  # noqa: E402
     MAX_REFLECT_FAILURES,

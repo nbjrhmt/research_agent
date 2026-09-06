@@ -1,0 +1,39 @@
+# ==================================================================================
+# .dockerignore —— 构建上下文排除清单(体积与安全)
+# 原则: 与 .gitignore 对齐 + 不把密钥/本地数据/缓存带入镜像构建上下文。
+# ==================================================================================
+
+# 密钥: 绝不进入构建上下文(运行期用 -e / --env-file 注入)
+.env
+.env.*
+
+# 虚拟环境 / 依赖缓存
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 版本控制 / IDE
+.git/
+.idea/
+*.iml
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# 本地运行时数据(容器内由 volume 或启动时自建)
+logs/
+temp_upload/
+report_history.json
+chroma_db/
+memory/chroma_db/
+.pytest_unit_tmp/
+pytest-cache-files-*
+pip_tmp/
+
+# 测试与辅助脚本不进生产镜像(镜像只含运行所需)
+tests/
+scripts/
+*.md

@@ -21,14 +21,10 @@ graph_builder 的其余离线单测见 tests/test_graph_builder.py。
 import os
 import sys
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
 
 def _sandbox_module():
-    """延迟导入, 保证任意工作目录先完成 sys.path 注入。"""
-    from tools import code_exec_tool  # noqa: E402
+    """延迟导入工具模块(项目根路径由 tests/conftest.py 统一注入, 2026 工程重构 P4)。"""
+    from tools import code_exec_tool
 
     return code_exec_tool
 

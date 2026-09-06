@@ -36,12 +36,22 @@ chroma_db/
 .coverage
 # pytest 在无法写 .pytest_cache 时退避生成的根目录缓存文件(正常环境不会出现)
 pytest-cache-files-*
+
+# pytest workdir fixture 的临时目录(见 tests/conftest.py, 用例结束自动删除)
+.pytest_unit_tmp/
+
+# 本地开发/沙盒临时目录(可随时删除)
+pip_tmp/
+pytest_tmp_work/
+.pytest_tmp/
 *.egg-info/
 build/
 dist/
 
 # streamlit 本地配置(如 config.toml)
 .streamlit/
+# 例外: 默认配置文件入库(容器化/无头启动开箱即用, 见 .streamlit/config.toml)
+!.streamlit/config.toml
 
 # 系统垃圾
 .DS_Store

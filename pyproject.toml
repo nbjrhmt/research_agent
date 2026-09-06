@@ -1,0 +1,80 @@
+# ==================================================================================
+# pyproject.toml —— 项目元数据与工具链配置(2026 工程重构 P4)
+#
+# 说明:
+#   1. 依赖的"权威清单"仍为根目录 requirements.txt(下限约束)+ requirements-lock.txt
+#      (精确锁定, CI 安装与一致性校验均以其为准)。此处 [project.dependencies] 与
+#      requirements.txt 保持一致, 二者只服务于不同场景:
+#        - requirements*.txt: 运行部署 / CI(与既有流程 100% 一致, 未改动);
+#        - pyproject: pip install -e . 的开发安装 / 发布元数据 / ruff 配置落位;
+#   2. pytest 配置保留在 pytest.ini(优先级高于本文件, 避免双份配置漂移);
+#   3. 版本号与 CHANGELOG.md v1.4.0 对齐(发版时 git tag v1.4.0, 见 README)。
+# ==================================================================================
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-agent"
+version = "1.4.0"
+description = "基于 LangGraph + Streamlit 的多轮反思迭代 AI 调研 Agent: 规划→联网搜索/PDF/受限代码执行→反思→报告, 结论强制素材溯源"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "nbjrhmt" }]
+keywords = [
+    "langgraph", "llm-agent", "streamlit", "research-agent",
+    "reflexion", "tool-calling", "sandbox", "openai-compatible",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+# 与 requirements.txt 保持同步(见文件头说明)
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "requests>=2.31.0",
+    "pypdf>=4.0.0",
+    "chromadb>=0.5.0",
+    "streamlit>=1.36.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.8.0",
+    "python-dotenv>=1.0.1",
+    "tiktoken>=0.7.0",
+]
+
+[project.optional-dependencies]
+# 开发/测试工具链(不影响运行依赖; CI 仍按既有流程单独安装 pytest/ruff)
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+# 预留: 无头 CLI 入口(P2 可选增强落地后启用), 当前不注册
+# research-agent = "core.cli:main"
+
+[tool.setuptools]
+# 包: core(引擎层) / tools(工具层) / memory(预留记忆模块)
+packages = ["core", "tools", "memory"]
+# 根目录平铺模块: 安装后可直接 import(测试不再依赖 cwd / sys.path)
+py-modules = ["graph_builder", "logging_setup", "state_schema"]
+
+[tool.ruff]
+# 规则集与既有 CI 行为保持一致(lint job 允许失败但不改动其配置; 本文件仅落位默认值)
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
