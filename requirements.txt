@@ -1,4 +1,7 @@
 langgraph>=0.2.0
+# LangGraph SqliteSaver(会话 checkpoint 持久化, 断点续研; 提供 langgraph.checkpoint.sqlite,
+# 需要 langgraph-checkpoint>=4.1.0, 见 core/checkpoint_store.py)
+langgraph-checkpoint-sqlite>=3.1.1
 langchain>=0.3.0
 langchain-openai>=0.2.0
 # 联网搜索统一走博查(Bocha) Web Search API(已移除 ddgs/必应抓取方案, 不再需要 ddgs 包)

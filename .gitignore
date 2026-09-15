@@ -29,6 +29,12 @@ logs/
 # ChromaDB 向量库(长期记忆预留模块的持久化目录, 启用后也不入库)
 chroma_db/
 
+# LangGraph SqliteSaver 会话 checkpoint 数据库(断点续研; 本地运行态文件, 严禁入库;
+# agent_checkpoints.db-wal/-shm 为 sqlite WAL 模式伴随文件, 同样不入库)
+agent_checkpoints.db
+agent_checkpoints.db-wal
+agent_checkpoints.db-shm
+
 # 测试 / 静态检查缓存
 .pytest_cache/
 .mypy_cache/

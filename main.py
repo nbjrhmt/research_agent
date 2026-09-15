@@ -20,6 +20,11 @@ import streamlit as st
 # ---- 2026 工程重构 P1: 纯业务逻辑已迁入 core/(配置/历史持久化/临时文件/上传预读) ----
 # main.py 只保留 Streamlit UI 与事件编排; core 包不依赖 streamlit, 可独立 import 与单测。
 # 以下全部以"旧私有名"别名导入, 保证本文件既有调用点零改动。
+from core.checkpoint_store import (  # Agent 会话 SqliteSaver 持久化(断点续研, 2026 增量新增)
+    SESSION_STATUS_DONE as _SESSION_STATUS_DONE,
+    get_checkpoint_store as _get_checkpoint_store,
+    checkpoint_store_disabled_reason as _checkpoint_store_disabled_reason,
+)
 from core.file_store import (  # 上传落盘 / 清理 / 删除 / partial 快照 / 图表发现
     cleanup_temp_files as _cleanup_temp_files,
     delete_uploaded_files as _delete_uploaded_files,
@@ -81,6 +86,22 @@ if "temp_boot_cleanup_done" not in st.session_state:
     # 应用启动(首个会话): 清理上一进程遗留的临时文件, 防止磁盘持续膨胀
     _cleanup_temp_files()
     st.session_state["temp_boot_cleanup_done"] = True
+
+
+# ============================ 🗂 Agent 会话 checkpoint 持久化(SqliteSaver, 断点续研) ============================
+# 增量功能(2026 新增, 见 core/checkpoint_store.py 与 README「Agent 会话持久化」):
+#   1. LangGraph 运行中间状态默认持久化到本地 sqlite 文件 agent_checkpoints.db(可经
+#      CHECKPOINT_DB_PATH 覆盖, 容器部署时指向挂载卷), Streamlit/进程重启后可恢复
+#      未完成的调研会话 —— 由 core.checkpoint_store 单例提供 SqliteSaver 实例;
+#   2. 完全兼容旧流程: CHECKPOINT_PERSIST=false 或 langgraph-checkpoint-sqlite 依赖缺失 /
+#      初始化失败时, _agent_store() 返回 None, 全部执行路径自动退回原有 InMemorySaver
+#      内存模式(每轮新建 thread_id, 重启即失), 旧行为零影响;
+#   3. 恢复语义: 任务中断后, 其 LangGraph checkpoint 仍保留在 sqlite 中; 在侧边栏选择该
+#      会话再点「开始调研」, 会以原 thread_id 从最后完成的节点继续执行(重跑中断的节点),
+#      已搜集素材/子任务/轮次计数均从 checkpoint 恢复, 完成后正常入历史。
+def _agent_store():
+    """返回当前进程可用的持久化 store; None = 内存模式(与旧版完全一致)。"""
+    return _get_checkpoint_store()
 
 try:
     # 依赖导入放在 try 里, 方便给用户明确的安装提示
@@ -178,32 +199,42 @@ def _salvage_run_materials(exc: Exception, graph, config, user_query: str,
                           type(exc).__name__, exc2)
 
 
-def _render_graph_run(user_query: str, fnames: list):
+def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | None = None):
     """
     运行 LangGraph 主流程并实时展示每一步:
     返回 (最终报告, 轮次, 素材总数, 生成图表路径列表)
+
+    :param resume_thread_id: 传入已存在的会话 thread_id 时进入"断点续研"模式 ——
+        以 None 作为图输入, LangGraph 从 sqlite 中该会话最后一个完成的 checkpoint
+        继续执行(中断的节点会重跑), 不重新预读上传文件(素材/上传清单在 checkpoint 内);
+        默认 None = 与旧版完全一致的新建空白会话(先预读上传文件, 再带初始 State 起跑)。
     """
     # ---- 0. 初始化 State: 上传文件先自动预读为素材 ----
+    # 注(断点续研): 恢复历史会话时跳过文件预读 —— uploaded_files 清单与已预读素材都在
+    # 原会话 checkpoint 状态里, 恢复执行以 checkpoint 为准(本次新上传文件不参与恢复)。
     initial_materials = []
     logs = []
-    for fname in fnames:
-        material, log_line = _ingest_upload(fname)
-        if material:
-            initial_materials.append(material)
-        logs.append(log_line)
-    for line in logs:
-        st.markdown(f"📎 {line}")
+    if resume_thread_id is None:
+        for fname in fnames:
+            material, log_line = _ingest_upload(fname)
+            if material:
+                initial_materials.append(material)
+            logs.append(log_line)
+        for line in logs:
+            st.markdown(f"📎 {line}")
 
-    initial_state = {
-        "user_query": user_query,
-        "sub_tasks": [],
-        "collected_info": initial_materials,   # 已预读素材
-        "reflection": "",
-        "final_report": "",
-        "iteration_count": 0,
-        "uploaded_files": fnames,
-        "steps_log": [],
-    }
+    initial_state = None
+    if resume_thread_id is None:
+        initial_state = {
+            "user_query": user_query,
+            "sub_tasks": [],
+            "collected_info": initial_materials,   # 已预读素材
+            "reflection": "",
+            "final_report": "",
+            "iteration_count": 0,
+            "uploaded_files": fnames,
+            "steps_log": [],
+        }
 
     # =====================================================================
     # P0-4 异常素材兜底: 从"构建 LLM"到"图流式执行"全程纳入 try 范围 —— 任何一步抛错
@@ -226,13 +257,28 @@ def _render_graph_run(user_query: str, fnames: list):
     # stream_mode="updates": 每执行完一个节点就产出一次 {节点名: 该节点更新的字段}
     try:
         llm = build_llm()   # 未配置 Key 时会在这里抛错, 由下方兜底 + 外层提示
-        # LangGraph checkpointer 兜底(工程边界: InMemorySaver 仅单进程内存, 服务重启即丢,
-        # 只适合单机演示; 中途异常素材靠下面落盘 partial JSON 保留, 见 README 已知局限)
-        checkpointer = InMemorySaver()
-        thread_id = uuid.uuid4().hex[:12]
+        # ---- LangGraph checkpointer 接线(2026 增量: 断点续研) ----
+        # 持久化 store 可用(默认) → SqliteSaver 写 agent_checkpoints.db, 进程重启后可按
+        # thread_id 恢复未完成会话; 不可用(开关关闭/依赖缺失/初始化失败) → 退回原
+        # InMemorySaver 内存模式(仅单进程内存, 服务重启即丢, 中途异常素材靠 partial JSON
+        # 落盘兜底, 见 README 已知局限)——两条路径均不改变节点执行逻辑。
+        store = _agent_store()
+        if store is not None:
+            checkpointer = store.saver
+            if resume_thread_id is not None:
+                thread_id = resume_thread_id
+            else:
+                thread_id = store.create_session(user_query)   # 新会话登记(running)
+        else:
+            checkpointer = InMemorySaver()
+            if resume_thread_id is not None:
+                thread_id = resume_thread_id
+            else:
+                thread_id = uuid.uuid4().hex[:12]
         config = {"configurable": {"thread_id": thread_id}}
         graph = build_graph(llm, web_search_tool=bocha_web_search, checkpointer=checkpointer)  # 博查API联网搜索
-        for event in graph.stream(initial_state, config=config, stream_mode="updates"):
+        run_input = None if resume_thread_id is not None else initial_state  # 恢复会话: 从 checkpoint 续跑
+        for event in graph.stream(run_input, config=config, stream_mode="updates"):
             for node_name, payload in event.items():
                 if node_name.startswith("__"):
                     continue  # 跳过 LangGraph 内部节点
@@ -279,7 +325,35 @@ def _render_graph_run(user_query: str, fnames: list):
     # ---- 收集本轮生成的图表图片(实现见 core.file_store.find_new_images) ----
     new_images = find_new_images(TEMP_UPLOAD_DIR, run_started_at)
 
-    return final_report, max_round, total_materials, new_images
+    # ---- 会话登记簿落账(断点续研) ----
+    # 能走到这里说明本轮已正常跑完(final_report 已生成): 把会话登记为完成, 便于侧边栏
+    # 区分"已完成"与"中断/运行中"。恢复会话的总轮次/素材数以 checkpoint 最终状态为准
+    # (事件流只含续跑增量, 直接累加会漏掉中断前的部分); 新建会话沿用事件流累计值
+    # (used_rounds = max_round, 与旧版返回值口径一致)。
+    used_rounds = max_round
+    if store is not None:
+        if resume_thread_id is not None:
+            try:
+                st_final = graph.get_state(config)
+                st_values = getattr(st_final, "values", None) or {}
+                if isinstance(st_values, dict):
+                    used_rounds = int(st_values.get("iteration_count") or used_rounds)
+                    total_materials = len(st_values.get("collected_info") or [])
+                    if not final_report:  # 防御性兜底: 报告文本以最终状态为准
+                        final_report = str(st_values.get("final_report") or "")
+            except Exception as exc3:  # noqa: BLE001 —— 读数失败不阻断结果展示
+                _logger.warning("恢复会话完成态读数失败(不影响报告展示): %s", exc3)
+        try:
+            store.update_session(
+                thread_id,
+                status=_SESSION_STATUS_DONE,
+                rounds=used_rounds,
+                materials=total_materials,
+            )
+        except Exception as exc4:  # noqa: BLE001 —— 登记失败只记录, 不阻断本次结果
+            _logger.warning("会话登记落账失败(thread_id=%s): %s", thread_id, exc4)
+
+    return final_report, used_rounds, total_materials, new_images
 
 
 # ============================ 📜 历史记录辅助(实现见 core/history_store.py) ============================
@@ -333,6 +407,51 @@ with st.sidebar:
         st.write("- 代码沙盒: 已整体关闭(ALLOW_CODE_EXEC=false), Agent 不执行任何代码")
     st.write("- 报告只基于素材, 严禁编造素材中不存在的事实")
     st.write("- 上传文件与图表保存在: `temp_upload/`")
+
+    # ============================ 🗂 Agent 会话(SqliteSaver 断点续研) ============================
+    # 会话选择组件(2026 增量新增, 不影响旧流程): 默认"新建空白会话"与旧版表现完全一致;
+    # 任务中断/进程重启后, 历史会话会出现在这里, 选中后点「开始调研」即从断点恢复执行。
+    # 数据来源: core.checkpoint_store(agent_sessions 登记表 + langgraph checkpoints 表,
+    # 同一 sqlite 文件 agent_checkpoints.db, 见该模块与 README「Agent 会话持久化」)。
+    st.divider()
+    with st.expander("🗂️ Agent 会话(断点续研)", expanded=False):
+        _store_ui = _agent_store()
+        if _store_ui is None:
+            st.caption("当前为**内存会话模式**: 重启后运行状态不保留(旧行为)。")
+            _store_reason = _checkpoint_store_disabled_reason()
+            if _store_reason:
+                st.caption(f"原因: {_store_reason}")
+        else:
+            _sessions = _store_ui.list_sessions(limit=30)
+            st.caption("持久化: SqliteSaver → `agent_checkpoints.db` 本地文件(重启后可恢复)")
+            if not _sessions:
+                st.caption("暂无历史会话: 完成一次调研或任务中断后, 会话会出现在这里, "
+                           "可选中并从断点恢复。")
+            else:
+                _session_labels = {
+                    s["thread_id"]: (
+                        ("✅ 已完成 · " if s.get("status") == _SESSION_STATUS_DONE else "⏳ 中断/进行中 · ")
+                        + f"{_clip_topic(s.get('user_query') or '(无主题)', 12)}"
+                        + f" · {s['thread_id'][:8]}"
+                        + (f" · {s.get('rounds')}轮/{s.get('materials')}条"
+                           if s.get("rounds") is not None and s.get("rounds") > 0 else "")
+                    )
+                    for s in _sessions
+                }
+                _picked = st.selectbox(
+                    "选择会话",
+                    options=[""] + list(_session_labels.keys()),
+                    format_func=lambda tid: _session_labels[tid] if tid else "➕ 新建空白会话(默认)",
+                    key="agent_session_picker",
+                )
+                # 每次重跑把当前选择写回 session_state, 「开始调研」按钮按它决定新建/恢复
+                st.session_state["agent_resume_thread"] = _picked or None
+                _picked_info = next((s for s in _sessions if s["thread_id"] == _picked), None)
+                if _picked_info is not None:
+                    st.caption(f"📋 完整主题: {_picked_info.get('user_query') or '(无主题)'}\n"
+                               f"⏰ 最近更新: {_picked_info.get('updated_at') or '-'}")
+                st.caption("选中历史会话后点「🚀 开始调研」将从**断点恢复**(沿用原主题/素材/轮次); "
+                           "不选择则新建空白会话, 与旧版完全一致。")
 
     # ============================ 📜 历史调研报告面板 ============================
     # 数据来源: st.session_state.report_history(内存, 每次启动从 report_history.json 自动恢复;
@@ -403,37 +522,66 @@ start_clicked = st.button("🚀 开始调研", type="primary", use_container_wid
 
 # ---------- 执行区 ----------
 if start_clicked:
-    topic = (user_query or "").strip()
-    if not topic:
-        st.warning("请先输入调研主题。")
-    else:
-        # 0) 启动前置校验: BOCHA_API_KEY 未配置时明确提示联网搜索不可用(不阻断, 可仅基于上传素材运行)
-        bocha_key = (os.getenv("BOCHA_API_KEY", "") or "").strip()
-        if not bocha_key or bocha_key.startswith("你的"):
-            st.warning("未配置 BOCHA_API_KEY: 联网搜索当前不可用, 任务将只能基于上传素材/已有资料进行。"
-                       "如需联网检索, 请在项目根目录 .env 填入博查 Key 后刷新页面。")
+    # ---- 断点续研: 解析侧边栏会话选择(默认不选 = 新建空白会话, 与旧版表现完全一致) ----
+    resume_store = _agent_store()
+    resume_thread_id = None
+    resume_session_info = None
+    if resume_store is not None:
+        chosen_tid = st.session_state.get("agent_resume_thread")
+        if chosen_tid:
+            chosen_info = resume_store.get_session(chosen_tid)
+            if chosen_info is None or not resume_store.has_checkpoint(chosen_tid):
+                # 登记存在但没有 checkpoint(任务在首个节点完成前就中断): 恢复无意义, 退回新建
+                st.warning("所选会话还没有可恢复的断点(任务刚开始就中断), 已按新建空白会话处理。")
+            elif chosen_info.get("status") == _SESSION_STATUS_DONE:
+                st.info("所选会话已在上一次运行中完成(报告已生成)。本次按默认行为新建空白会话。")
+            else:
+                resume_thread_id = chosen_tid
+                resume_session_info = chosen_info
 
-        # 0.5) 开始新任务前自动清理过期临时文件(保留当前结果面板仍在引用的图表)
-        keep_images = (st.session_state.get("last_run") or {}).get("images") or []
-        _cleanup_temp_files(keep_files=keep_images)
-
-        # 1) 保存上传文件(保存失败也要明确提示, 不静默跳过)
+    if resume_thread_id:
+        # 恢复执行: 主题沿用原会话登记(本次输入框内容不参与); 素材/上传清单都在 checkpoint
+        # 状态内, 本次不上传不预读(见 _render_graph_run 注释), 中断的节点会重跑。
+        topic = str((resume_session_info or {}).get("user_query") or "").strip() or (user_query or "").strip()
         fnames = []
-        for up in uploaded_files:
-            if up.size is not None and up.size > MAX_FILE_SIZE_MB * 1024 * 1024:
-                st.warning(f"跳过超大文件: {up.name}(>{MAX_FILE_SIZE_MB}MB)")
-                continue
-            try:
-                fnames.append(save_upload(up.getbuffer(), up.name))
-            except OSError as exc:
-                st.error(f"保存上传文件 {up.name} 失败(磁盘/权限问题): {exc}, 该文件将被跳过")
+        st.info(f"🗂 恢复会话 {resume_thread_id[:8]}…:「{_clip_topic(topic, 40)}」"
+                f"—— 已搜集素材/轮次从 checkpoint 恢复, 继续未完成的调研。")
+    else:
+        topic = (user_query or "").strip()
+        fnames = []
+        if not topic:
+            st.warning("请先输入调研主题。")
+
+    if resume_thread_id or topic:   # 有可执行内容: 恢复会话, 或主题非空的新建会话
+        if not resume_thread_id:
+            # 0) 启动前置校验: BOCHA_API_KEY 未配置时明确提示联网搜索不可用(不阻断, 可仅基于上传素材运行)
+            bocha_key = (os.getenv("BOCHA_API_KEY", "") or "").strip()
+            if not bocha_key or bocha_key.startswith("你的"):
+                st.warning("未配置 BOCHA_API_KEY: 联网搜索当前不可用, 任务将只能基于上传素材/已有资料进行。"
+                           "如需联网检索, 请在项目根目录 .env 填入博查 Key 后刷新页面。")
+
+            # 0.5) 开始新任务前自动清理过期临时文件(保留当前结果面板仍在引用的图表)
+            keep_images = (st.session_state.get("last_run") or {}).get("images") or []
+            _cleanup_temp_files(keep_files=keep_images)
+
+            # 1) 保存上传文件(保存失败也要明确提示, 不静默跳过)
+            for up in uploaded_files:
+                if up.size is not None and up.size > MAX_FILE_SIZE_MB * 1024 * 1024:
+                    st.warning(f"跳过超大文件: {up.name}(>{MAX_FILE_SIZE_MB}MB)")
+                    continue
+                try:
+                    fnames.append(save_upload(up.getbuffer(), up.name))
+                except OSError as exc:
+                    st.error(f"保存上传文件 {up.name} 失败(磁盘/权限问题): {exc}, 该文件将被跳过")
 
         st.markdown("---")
         st.subheader("3️⃣ 实时执行日志")
         status = None
         try:
             with st.status("⏳ 任务执行中……", expanded=True) as status:
-                report, used_rounds, material_count, images = _render_graph_run(topic, fnames)
+                # resume_thread_id 非空 = 从该会话 checkpoint 继续执行(断点续研)
+                report, used_rounds, material_count, images = _render_graph_run(
+                    topic, fnames, resume_thread_id=resume_thread_id or None)
                 status.update(label=f"✅ 执行完成(共 {used_rounds} 轮, {material_count} 条素材)", state="complete", expanded=False)
 
             # 存入 session_state, 后续任何页面交互都不会丢失本次结果

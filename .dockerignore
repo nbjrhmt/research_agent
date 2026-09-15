@@ -29,6 +29,11 @@ temp_upload/
 report_history.json
 chroma_db/
 memory/chroma_db/
+# LangGraph 会话 checkpoint 数据库: 容器内不打包 db 文件, 由宿主机 volume 挂载
+# (见 README「Agent 会话持久化」, 容器运行时通过 CHECKPOINT_DB_PATH 指向挂载卷)
+agent_checkpoints.db
+agent_checkpoints.db-wal
+agent_checkpoints.db-shm
 .pytest_unit_tmp/
 pytest-cache-files-*
 pip_tmp/

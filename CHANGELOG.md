@@ -2,6 +2,60 @@
 
 本项目变更记录。版本号规则: 语义化版本(主.次.修订)。
 
+## [1.5.0] - 2026-09-08 — Agent 会话 SqliteSaver 状态持久化(断点续研)
+
+> 本轮目标(增量开发): 在不动既有业务逻辑的前提下, 为 LangGraph Agent 会话接入
+> SqliteSaver checkpoint 持久化 —— 运行中间状态落盘本地 sqlite, 程序重启后可从
+> 断点恢复未完成的调研会话; core 层 / graph 节点 / Streamlit 页面 / 全部既有单元测试
+> / pytest 配置 / CI / Dockerfile 均保持原有行为不变。
+
+### 🟢 新增功能
+
+1. **LangGraph SqliteSaver 会话 checkpoint 持久化(核心)**
+   - 新增 `core/checkpoint_store.py`(纯 core 层, 不依赖 streamlit / 根目录平铺模块):
+     `CheckpointStore` 封装 `langgraph.checkpoint.sqlite.SqliteSaver`(懒加载依赖), 同一
+     sqlite 文件内叠加会话登记表 `agent_sessions`(主题/状态/轮次/素材数/时间), 供前端
+     列出历史会话、切换恢复;
+   - 数据库文件命名 `agent_checkpoints.db`, 默认存放于项目根目录, 可用环境变量
+     `CHECKPOINT_DB_PATH` 覆盖; 文件已加入 `.gitignore` / `.dockerignore`(不入库、
+     不打包进镜像, 容器部署由宿主机 volume 挂载);
+   - 进程级单例 `get_checkpoint_store()`: `CHECKPOINT_PERSIST=false` / 依赖缺失 /
+     初始化失败一律返回 None —— 调用方自动退回原有 InMemorySaver 内存模式, 旧流程零影响;
+   - 图执行方式不变: `build_graph(..., checkpointer=store.saver)`(build_graph 的
+     checkpointer 可选参数为既有接口, 本轮未改任何节点逻辑, 仅更新注释文档)。
+
+2. **Streamlit 最小改动: 会话选择组件(断点续研)**
+   - `main.py` 侧边栏新增「🗂️ Agent 会话(断点续研)」: 展示持久化状态、列出历史会话
+     (状态/主题/thread_id/轮次素材), 可"新建空白会话(默认)"或选中历史会话恢复;
+   - 恢复语义: 选中"中断/进行中"会话后点「开始调研」, 以原 thread_id 从最后一个完成的
+     checkpoint 继续执行(中断的节点会重跑), 已搜集素材/子任务/轮次均从 checkpoint 恢复;
+   - 默认行为不变: 不选历史会话 = 新建空白会话, 与旧版表现完全一致; 会话完成/异常
+     的素材兜底(partial JSON)、历史报告入库等既有机制全部保留。
+
+3. **单元测试**
+   - 新增 `tests/test_checkpoint_store.py`(13 条, 全部离线): 默认库文件名与 env 解析、
+     表结构、会话登记簿 CRUD/倒序/无记录 no-op、`has_checkpoint`、同库"重启"后状态
+     可读可续、真实 research 图"运行中崩溃 → 重建 → 恢复"端到端、不传 checkpointer
+     时纯内存模式守护、模块 import 无副作用 —— sqlite 一律 `:memory:`(不产生磁盘文件);
+   - 既有 113 条用例零改动; 全量 `python -m pytest tests` → **126 passed**。
+
+4. **依赖与文档**
+   - 新增依赖 `langgraph-checkpoint-sqlite>=3.1.1`(提供 `langgraph.checkpoint.sqlite`,
+     与 langgraph 1.2.x / langgraph-checkpoint 4.x 配套); `requirements.txt` /
+     `pyproject.toml` / `requirements-lock.txt` 同步更新(锁文件补充
+     langgraph-checkpoint-sqlite==3.1.1 / aiosqlite==0.22.1 / sqlite-vec==0.1.9,
+     CI 一致性校验通过);
+   - README 新增「Agent 会话持久化」说明(见 §4 依赖 / §5.1 Docker volume / §7 功能
+     特性 / §8 已知局限 / §9 目录 / §11 升级迁移); `.env.example` 补充
+     `CHECKPOINT_PERSIST` / `CHECKPOINT_DB_PATH` 说明; 版本号升至 1.5.0。
+
+### 🟧 兼容性说明
+
+- 不传 checkpointer(或持久化被关闭/依赖缺失)时, 图与页面走原内存模式, 行为与 1.4.0
+  完全一致; 旧 `report_history.json` / partial 素材兜底 / 上传清理逻辑均未改动;
+- 持久化边界: 单进程使用(多进程/多实例并发写同一 sqlite 文件不受支持), 见
+  README「已知项目局限」。
+
 ## [1.4.0] - 2026-09-04 — P0 高危项闭环 + P1 完整可交付版本
 
 > 本轮目标: 修复 P0 高危安全问题与可靠性缺口、补齐 P1 交付项(P2 仅记录不实现)。

@@ -8,7 +8,7 @@
 #        - requirements*.txt: 运行部署 / CI(与既有流程 100% 一致, 未改动);
 #        - pyproject: pip install -e . 的开发安装 / 发布元数据 / ruff 配置落位;
 #   2. pytest 配置保留在 pytest.ini(优先级高于本文件, 避免双份配置漂移);
-#   3. 版本号与 CHANGELOG.md v1.4.0 对齐(发版时 git tag v1.4.0, 见 README)。
+#   3. 版本号与 CHANGELOG.md v1.5.0 对齐(发版时 git tag v1.5.0, 见 README)。
 # ==================================================================================
 [build-system]
 requires = ["setuptools>=68"]
@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-agent"
-version = "1.4.0"
+version = "1.5.0"
 description = "基于 LangGraph + Streamlit 的多轮反思迭代 AI 调研 Agent: 规划→联网搜索/PDF/受限代码执行→反思→报告, 结论强制素材溯源"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,8 @@ classifiers = [
 # 与 requirements.txt 保持同步(见文件头说明)
 dependencies = [
     "langgraph>=0.2.0",
+    # LangGraph SqliteSaver(会话 checkpoint 持久化, 断点续研; 见 core/checkpoint_store.py)
+    "langgraph-checkpoint-sqlite>=3.1.1",
     "langchain>=0.3.0",
     "langchain-openai>=0.2.0",
     "requests>=2.31.0",

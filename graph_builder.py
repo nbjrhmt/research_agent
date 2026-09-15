@@ -40,8 +40,10 @@ graph_builder.py —— LangGraph 图构建: 定义 State、节点、边、条�
        MAX_REFLECT_FAILURES 后强制进入报告节点, 不再空耗迭代轮次;
     4. 全部 system prompt 抽离到 prompts/*.txt; 报告提示词强制要求逐条结论标注
        【素材N】编号与来源 URL;
-    5. 素材新增去重(文本级, P2 计划升级语义去重); 可选的 LangGraph checkpointer
-       兜底(任务异常时保留已搜集素材, 单进程内存, 重启即失, 见 build_graph 注释)。
+    5. 素材新增去重(文本级, P2 计划升级语义去重); LangGraph checkpointer 可选接线: 传入
+       持久化 saver(如 core/checkpoint_store 封装的 SqliteSaver, 本地 agent_checkpoints.db)
+       即可在进程重启后恢复未完成的调研会话; 不传 checkpointer 时维持原内存模式
+       (任务异常时保留已搜集素材, 重启即失, 见 build_graph 注释)。
 """
 import json
 import os
@@ -711,15 +713,22 @@ def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=
     :param web_search_tool: 联网搜索可调用对象(query 为唯一位置参数, 返回素材文本);
                             默认使用 tools.search_tool.bocha_web_search(博查 API),
                             测试时可注入假搜索便于离线验证
-    :param checkpointer:   可选的 LangGraph checkpointer(如 InMemorySaver), 传入后编译
-                            为可断点恢复的图: 任务中途异常时可通过 get_state 取回
-                            已搜集素材(main.py / _e2e_test 用作异常兜底), 默认 None
+    :param checkpointer:   可选的 LangGraph checkpointer, 传入后编译为可断点/持久化恢复的图:
+                           - 不传(默认 None): 纯内存运行, 无断点语义 —— 与本函数历史行为
+                             完全一致(旧调用方零影响);
+                           - 传 InMemorySaver: 可断点取回状态(main.py 异常兜底用), 重启即失;
+                           - 传持久化 saver(如 core/checkpoint_store 封装的 SqliteSaver →
+                             本地 agent_checkpoints.db): 中间状态落盘 sqlite, 进程/服务重启后
+                             仍可按同一 thread_id 恢复继续未完成的调研会话(main.py 断点续研,
+                             2026 增量实现; 详见 core/checkpoint_store.py 与 README)
 
-    ★ 工程边界备注(见 README「已知项目局限」): 本项目使用 InMemorySaver, 会话状态只保存在
-      单进程内存 —— Streamlit 服务重启/进程退出后图运行状态即丢失, 仅适合单机演示;
-      任务中途异常的素材靠 _save_partial_run 落盘 temp_upload/partial_*.json 兜底。
-      P2 待优化点(本版本只记录、不实现): 接入文件系统/Redis 持久化 saver
-      (如 SqliteSaver / PostgresSaver / RedisSaver), 支持多实例与服务重启恢复。
+    ★ 持久化边界备注(见 README「已知项目局限」): 本图不做任何持久化约定, 持久化与否
+      完全取决于调用方传入的 checkpointer:
+      - InMemorySaver: 会话状态只保存在单进程内存 —— Streamlit 服务重启/进程退出后
+        图运行状态即丢失, 仅适合单机演示; 任务中途异常的素材靠 _save_partial_run
+        落盘 temp_upload/partial_*.json 兜底;
+      - SqliteSaver(core/checkpoint_store): 状态持久化到本地 sqlite 文件, 重启后可恢复;
+        仍为单进程边界(多实例并发写同一 sqlite 文件不受支持, 见 README 已知局限)。
     """
     graph = StateGraph(AgentState)
 
