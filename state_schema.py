@@ -41,3 +41,9 @@ class AgentState(TypedDict, total=False):
     reflection_failures: int
     uploaded_files: List[str]
     steps_log: Annotated[List[str], add]  # 日志同样只追加
+
+    # ---------------- HITL(Human-in-the-loop, 可选, v1.6.0) ----------------
+    # 人工确认节点恢复后的决策路由字段: confirmation_node 通过 LangGraph interrupt
+    # 暂停执行, 恢复时写入 human_continue(True=继续搜集→tool_node, False=停止→report_node),
+    # 由 route_after_confirmation 纯函数路由; 未启用 HITL 时不存在该字段。
+    human_continue: bool

@@ -14,3 +14,6 @@ matplotlib>=3.8.0
 python-dotenv>=1.0.1
 # token 计数(tiktoken): 素材按真实 token 预算裁剪, 替代纯字符截断
 tiktoken>=0.7.0
+# API 服务化(server.py): FastAPI 把 LangGraph Agent 封装为 REST 服务
+fastapi>=0.110.0
+uvicorn>=0.29.0

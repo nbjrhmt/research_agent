@@ -53,6 +53,7 @@ from typing import Any, Dict, List
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from core.config import env_flag, env_float, env_int  # 统一环境变量解析(2026 重构 P1)
 from logging_setup import get_logger
@@ -446,6 +447,53 @@ def _clean_keywords(value: Any, max_items: int = 8, max_len: int = 200) -> List[
     return out
 
 
+# ============================ 记忆检索节点(可选, v1.6.0 长期记忆/RAG) ============================
+MEMORY_RUN_TOP_K = 3      # 历史任务记忆检索条数
+MEMORY_DOC_TOP_K = 3      # 上传文档片段检索条数
+
+
+def make_memory_retrieve_node(store, run_top_k: int = MEMORY_RUN_TOP_K,
+                              doc_top_k: int = MEMORY_DOC_TOP_K):
+    """
+    ①' 记忆检索节点(可选, 位于 planner 之前): 任务开始时检索相似历史素材并注入。
+
+    两类检索(见 memory/vector_memory.py):
+        - kind=run      跨任务长期记忆: 检索相似历史调研, 复用已搜集素材, 减少重复搜索;
+        - kind=doc_chunk 上传文档分块(RAG): 检索与 user_query 最相关的文档片段,
+                        大文件不再只靠全文预览(全文可能被 token 预算截断)。
+    注入素材带【历史记忆】/【文档片段】前缀, 与其他素材一样参与反思判断与报告
+    溯源(报告强制标注素材编号)。检索失败只记日志、不阻断任务(记忆是增强而非依赖)。
+    """
+    def memory_retrieve_node(state: AgentState) -> dict:
+        user_query = str(state.get("user_query") or "").strip()
+        logs: List[str] = []
+        entries: List[str] = []
+        run_hits, doc_hits = [], []
+        try:
+            run_hits = store.search(user_query, top_k=run_top_k, kind="run") or []
+            for hit in run_hits:
+                content = str(hit.get("content") or "")
+                if content.strip():
+                    src = str(hit.get("query") or "历史调研").strip()
+                    entries.append(f"【历史记忆】相关历史调研: {src}\n{content[:1500]}")
+            doc_hits = store.search(user_query, top_k=doc_top_k, kind="doc_chunk") or []
+            for hit in doc_hits:
+                content = str(hit.get("content") or "")
+                if content.strip():
+                    src = str(hit.get("source_name") or "上传文档").strip()
+                    entries.append(f"【文档片段】来源: {src}\n{content[:1500]}")
+        except Exception as exc:  # noqa: BLE001 —— 记忆检索失败不阻断主流程
+            logs.append(f"记忆检索失败(不影响任务执行): {type(exc).__name__}: {exc}")
+        if entries:
+            logs.append(f"记忆检索: 命中历史记忆 {len(run_hits)} 条 / 文档片段 {len(doc_hits)} 条, "
+                        f"已注入素材(带来源标注)")
+        else:
+            logs.append("记忆检索: 未命中相似历史素材或文档片段")
+        return {"collected_info": entries, "steps_log": logs}
+
+    return memory_retrieve_node
+
+
 # ============================ 节点函数 ============================
 def make_planner_node(llm: ChatOpenAI):
     """① 规划节点: 大模型把需求拆成若干"用于搜集信息"的子任务, 不直接回答问题"""
@@ -687,6 +735,55 @@ def make_report_node(llm: ChatOpenAI):
     return report_node
 
 
+# ============================ HITL 人工确认节点(可选, v1.6.0) ============================
+def make_confirmation_node():
+    """
+    ⑤ 人工确认节点(Human-in-the-loop, 可选): 反思判定"继续搜集"时暂停执行, 等人工确认。
+
+    通过 LangGraph interrupt 实现: 图执行到本节点时暂停(不报错), 调用方检查
+    graph.get_state(config).next 发现"confirmation_node"后, 展示人工确认 UI,
+    再以 graph.invoke(Command(resume=decision), config) 恢复执行。决策语义:
+        - "continue"(或 yes/true/1 等): 恢复后 human_continue=True → 回 tool_node 继续搜集;
+        - "stop"(或 no/false/0 等): 恢复后 human_continue=False → 进 report_node,
+          基于现有素材直接出报告(不浪费剩余轮次)。
+
+    ★ 设计要点: interrupt 的值(question/round/materials_count/reflection)由调用方
+    展示给用户; 恢复值仅作决策, 不注入素材, 不改变 State 其他字段 —— 人工干预
+    只是"继续/停止"的闸门, 报告内容仍只基于已搜集素材。
+    """
+    def confirmation_node(state: AgentState) -> dict:
+        round_no = int(state.get("iteration_count") or 0)
+        materials_count = len(state.get("collected_info") or [])
+        reflection = str(state.get("reflection") or "")
+        # 首次执行: 暂停并抛出人工确认请求(interrupt 的返回值 = 恢复时 resume 值)
+        decision = interrupt({
+            "type": "human_confirmation",
+            "round": round_no,
+            "materials_count": materials_count,
+            "reflection": _clip(reflection, 500),
+            "question": f"反思判定信息不足, 是否继续搜集资料?已进行 {round_no} 轮, "
+                        f"已收集 {materials_count} 条素材",
+        })
+        decision = str(decision or "continue").strip().lower()
+        if decision in ("stop", "no", "false", "0", "停止", "停下"):
+            return {"human_continue": False,
+                    "steps_log": ["⏸ 人工确认: 用户选择停止搜集, 将基于现有素材生成报告"]}
+        return {"human_continue": True,
+                "steps_log": ["✅ 人工确认: 用户选择继续搜集"]}
+
+    return confirmation_node
+
+
+def route_after_confirmation(state: AgentState) -> str:
+    """人工确认节点之后的条件分支(纯函数, 单测友好):
+        - human_continue=False(用户停止)→ report_node, 基于现有素材出报告;
+        - 其余(默认继续)→ tool_node, 进入下一轮工具搜集。
+    """
+    if state.get("human_continue") is False:
+        return "report_node"
+    return "tool_node"
+
+
 def route_after_reflection(state: AgentState) -> str:
     """
     反思节点之后的条件分支(检查顺序自上而下, 命中即返回):
@@ -705,9 +802,12 @@ def route_after_reflection(state: AgentState) -> str:
     return "tool_node"
 
 
-def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=None):
+def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=None,
+                memory_store=None, memory_run_top_k: int = MEMORY_RUN_TOP_K,
+                memory_doc_top_k: int = MEMORY_DOC_TOP_K,
+                human_in_the_loop: bool = False):
     """
-    组装并编译 LangGraph: planner → tool → reflection ⇄ (tool) → report
+    组装并编译 LangGraph: [memory_retrieve →] planner → tool ⇄ [confirmation ⇄] reflection → report
 
     :param llm:            已配置好的 ChatOpenAI 实例
     :param web_search_tool: 联网搜索可调用对象(query 为唯一位置参数, 返回素材文本);
@@ -721,6 +821,15 @@ def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=
                              本地 agent_checkpoints.db): 中间状态落盘 sqlite, 进程/服务重启后
                              仍可按同一 thread_id 恢复继续未完成的调研会话(main.py 断点续研,
                              2026 增量实现; 详见 core/checkpoint_store.py 与 README)
+    :param memory_store:   可选的长期记忆库(memory.vector_memory.MemoryStore)。传入后在图首
+                           插入 memory_retrieve_node: 检索相似历史调研/文档片段注入素材
+                           (长期记忆 + RAG); None = 不检索, 与旧行为完全一致。
+    :param memory_run_top_k: 历史任务记忆检索条数(默认 3)
+    :param memory_doc_top_k: 上传文档片段检索条数(默认 3)
+    :param human_in_the_loop: 是否启用人工确认节点(默认 False, 与旧行为完全一致)。
+                           True = 反思判定"继续搜集"时先暂停(interrupt), 由调用方展示
+                           确认 UI 并以 Command(resume=continue/stop) 恢复 —— 需要
+                           checkpointer 配合(LangGraph interrupt 依赖断点能力)。
 
     ★ 持久化边界备注(见 README「已知项目局限」): 本图不做任何持久化约定, 持久化与否
       完全取决于调用方传入的 checkpointer:
@@ -736,21 +845,45 @@ def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=
     graph.add_node("tool_node", make_tool_node(llm, web_search_tool=web_search_tool))
     graph.add_node("reflection_node", make_reflection_node(llm))
     graph.add_node("report_node", make_report_node(llm))
+    if human_in_the_loop:
+        graph.add_node("confirmation_node", make_confirmation_node())
 
-    graph.add_edge(START, "planner_node")
+    if memory_store is not None:
+        # 长期记忆/RAG 检索节点: 先注入相似历史素材, 再进入规划(素材只增不减)
+        graph.add_node("memory_retrieve_node",
+                       make_memory_retrieve_node(memory_store, run_top_k=memory_run_top_k,
+                                                 doc_top_k=memory_doc_top_k))
+        graph.add_edge(START, "memory_retrieve_node")
+        graph.add_edge("memory_retrieve_node", "planner_node")
+    else:
+        graph.add_edge(START, "planner_node")
+
     graph.add_edge("planner_node", "tool_node")
     graph.add_edge("tool_node", "reflection_node")
-    graph.add_conditional_edges(
-        "reflection_node",
-        route_after_reflection,
-        {"tool_node": "tool_node", "report_node": "report_node"},
-    )
+    if human_in_the_loop:
+        # 反思判定"信息不足" → 先经人工确认闸门(confirmation_node), 恢复后再决定
+        # 继续搜集(tool_node)或停止出报告(report_node); 判定充足仍直接进报告节点。
+        graph.add_conditional_edges(
+            "reflection_node",
+            route_after_reflection,
+            {"tool_node": "confirmation_node", "report_node": "report_node"},
+        )
+        graph.add_conditional_edges(
+            "confirmation_node",
+            route_after_confirmation,
+            {"tool_node": "tool_node", "report_node": "report_node"},
+        )
+    else:
+        graph.add_conditional_edges(
+            "reflection_node",
+            route_after_reflection,
+            {"tool_node": "tool_node", "report_node": "report_node"},
+        )
     graph.add_edge("report_node", END)
 
-    # ---------------- 长期记忆接入点(可选模块, MVP 先注释) ----------------
-    # 主流程跑通后, 在这里补记忆检索/保存钩子, 例如:
-    #   任务开始前: 用 MemoryStore.search(user_query) 找到相似历史素材 → 预置进 collected_info
-    #   任务结束后: store.save_run(user_query, materials, report)
+    # ---------------- 长期记忆接入点(已由 memory_retrieve_node 承担, v1.6.0) ----------------
+    # 检索注入: memory_retrieve_node(图首节点, 任务开始前检索相似历史素材/文档片段);
+    # 保存回写: 由调用方(main.py / server.py)在任务完成后调用 store.save_run(query, materials, report)。
     if checkpointer is not None:
         return graph.compile(checkpointer=checkpointer)
     return graph.compile()

@@ -488,3 +488,170 @@ def test_tool_node_round_logs_contain_material_count():
     out = node({"user_query": "q", "iteration_count": 0, "collected_info": [],
                 "uploaded_files": []})
     assert any("素材累计 1 条" in line for line in (out.get("steps_log") or []))
+
+# =====================================================================
+# v1.6.0: 长期记忆/RAG 记忆检索节点(make_memory_retrieve_node / build_graph 接线)
+# =====================================================================
+class _FakeMemoryStore:
+    """内存版假记忆库: 按 kind 返回固定检索结果, 用于验证节点注入与图接线。"""
+
+    def __init__(self, run_hits=None, doc_hits=None):
+        self.run_hits = run_hits or []
+        self.doc_hits = doc_hits or []
+        self.seen_kinds = []
+
+    def search(self, query, top_k=3, kind=None):
+        self.seen_kinds.append(kind)
+        if kind == "run":
+            return list(self.run_hits)
+        if kind == "doc_chunk":
+            return list(self.doc_hits)
+        return list(self.run_hits) + list(self.doc_hits)
+
+
+def test_memory_retrieve_node_injects_history_and_doc_chunks():
+    """记忆检索节点: 历史记忆与文档片段分别注入 collected_info, 且日志说明命中。"""
+    store = _FakeMemoryStore(
+        run_hits=[{"content": "历史素材A", "query": "相似主题1"}],
+        doc_hits=[{"content": "文档块B", "source_name": "白皮书.pdf"}],
+    )
+    node = gb.make_memory_retrieve_node(store, run_top_k=3, doc_top_k=3)
+    out = node({"user_query": "调研主题", "collected_info": []})
+
+    entries = out.get("collected_info") or []
+    assert len(entries) == 2
+    assert "【历史记忆】" in entries[0] and "相似主题1" in entries[0]
+    assert "【文档片段】" in entries[1] and "白皮书.pdf" in entries[1]
+    logs = "\n".join(out.get("steps_log") or [])
+    assert "命中历史记忆 1 条" in logs and "文档片段 1 条" in logs
+    assert store.seen_kinds == ["run", "doc_chunk"]
+
+
+def test_memory_retrieve_node_no_hits_returns_empty_materials():
+    """无命中时: 不注入素材, 日志如实说明, 不抛异常。"""
+    store = _FakeMemoryStore()
+    node = gb.make_memory_retrieve_node(store)
+    out = node({"user_query": "全新主题", "collected_info": []})
+    assert (out.get("collected_info") or []) == []
+    assert any("未命中" in line for line in (out.get("steps_log") or []))
+
+
+def test_memory_retrieve_node_search_failure_does_not_block():
+    """检索失败: 记入日志但不阻断任务(记忆是增强而非依赖)。"""
+
+    class _BoomStore:
+        def search(self, *a, **k):
+            raise RuntimeError("向量库不可用(测试)")
+
+    node = gb.make_memory_retrieve_node(_BoomStore())
+    out = node({"user_query": "主题", "collected_info": []})
+    assert (out.get("collected_info") or []) == []
+    assert any("记忆检索失败" in line for line in (out.get("steps_log") or []))
+
+
+def test_build_graph_with_memory_store_has_retrieve_node():
+    """build_graph 传入 memory_store 时: 图含 memory_retrieve_node 且位于规划之前。"""
+    graph = gb.build_graph(llm=ScriptedLLM(["{}"]), web_search_tool=lambda q: "x",
+                           checkpointer=None, memory_store=_FakeMemoryStore())
+    nodes = graph.get_graph().nodes
+    assert "memory_retrieve_node" in nodes
+    # START 的下一跳必须是记忆检索节点(再进入 planner)
+    edges = graph.get_graph().edges
+    assert any(e.source == "__start__" and e.target == "memory_retrieve_node" for e in edges)
+
+
+def test_build_graph_without_memory_store_no_retrieve_node():
+    """不传 memory_store(默认): 图结构与旧版完全一致, 无记忆节点。"""
+    graph = gb.build_graph(llm=ScriptedLLM(["{}"]), web_search_tool=lambda q: "x")
+    assert "memory_retrieve_node" not in graph.get_graph().nodes
+    edges = graph.get_graph().edges
+    assert any(e.source == "__start__" and e.target == "planner_node" for e in edges)
+
+# =====================================================================
+# v1.6.0: HITL 人工确认节点(confirmation_node / route_after_confirmation / build_graph 接线)
+# =====================================================================
+from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
+from langgraph.types import Command  # noqa: E402
+
+from graph_builder import (  # noqa: E402
+    route_after_confirmation,
+)
+
+
+def test_route_after_confirmation_pure_function():
+    """人工确认后路由: 停止→report_node, 继续/默认→tool_node(纯函数, 单测友好)。"""
+    assert route_after_confirmation({"human_continue": False}) == "report_node"
+    assert route_after_confirmation({"human_continue": True}) == "tool_node"
+    assert route_after_confirmation({}) == "tool_node"   # 字段缺失默认继续
+
+
+def test_build_graph_hitl_adds_confirmation_node():
+    """human_in_the_loop=True: 图含 confirmation_node; False(默认)则无(旧行为不变)。"""
+    g_on = gb.build_graph(llm=ScriptedLLM(["{}"]), web_search_tool=lambda q: "x",
+                          human_in_the_loop=True)
+    assert "confirmation_node" in g_on.get_graph().nodes
+    g_off = gb.build_graph(llm=ScriptedLLM(["{}"]), web_search_tool=lambda q: "x")
+    assert "confirmation_node" not in g_off.get_graph().nodes
+
+
+def _run_hitl_graph(llm_outputs, initial_query="调研主题", resume=None):
+    """完整跑一次带 HITL 的图: 返回 (最终状态 values, 中断时 next 列表)。
+
+    - resume=None: 第一次执行, 应在 confirmation_node 处暂停;
+    - resume="continue"/"stop": 以 Command(resume=...) 恢复并跑到结束。
+    """
+    llm = ScriptedLLM(llm_outputs)
+    graph = gb.build_graph(llm=llm, web_search_tool=lambda q: "【素材】搜索结果内容。",
+                           checkpointer=InMemorySaver(), human_in_the_loop=True)
+    config = {"configurable": {"thread_id": "hitl-test-1"}}
+    initial = {"user_query": initial_query, "collected_info": [], "iteration_count": 0}
+    for _event in graph.stream(initial, config=config, stream_mode="updates"):
+        pass
+    state = graph.get_state(config)
+    if resume is None:
+        return state.values, state.next
+    for _event in graph.stream(Command(resume=resume), config=config, stream_mode="updates"):
+        pass
+    return graph.get_state(config).values, ()
+
+
+def test_hitl_interrupt_pauses_before_continue():
+    """反思判定不足时: 任务在 confirmation_node 暂停(next 指向它), 不直接继续。"""
+    outputs = [
+        '{"sub_tasks": ["子任务1"]}',
+        '{"tool": "bocha_web_search", "query": "关键词"}',
+        '{"sufficient": false, "reason": "信息不足", "missing_topics": ["更多"]}',
+    ]
+    values, next_nodes = _run_hitl_graph(outputs)
+    assert "confirmation_node" in next_nodes
+    assert len(values.get("collected_info") or []) >= 1   # 已搜集素材保留
+
+
+def test_hitl_resume_continue_keeps_collecting():
+    """恢复 continue: 回到工具节点继续搜集, 反思充足后出报告。"""
+    outputs = [
+        '{"sub_tasks": ["子任务1"]}',
+        '{"tool": "bocha_web_search", "query": "第一轮"}',
+        '{"sufficient": false, "reason": "信息不足", "missing_topics": ["补充"]}',
+        '{"tool": "bocha_web_search", "query": "第二轮"}',
+        '{"sufficient": true, "reason": "信息已充足", "missing_topics": []}',
+        "# 最终报告\n结论(素材1)。",
+    ]
+    values, _next = _run_hitl_graph(outputs, resume="continue")
+    assert "最终报告" in values.get("final_report") or ""
+    assert int(values.get("iteration_count") or 0) >= 2      # 恢复后继续跑了第二轮
+    assert len(values.get("collected_info") or []) >= 2      # 素材只增不减
+
+
+def test_hitl_resume_stop_generates_report_without_more_rounds():
+    """恢复 stop: 不再搜集, 基于现有素材直接出报告(轮次不再增加)。"""
+    outputs = [
+        '{"sub_tasks": ["子任务1"]}',
+        '{"tool": "bocha_web_search", "query": "第一轮"}',
+        '{"sufficient": false, "reason": "信息不足", "missing_topics": ["补充"]}',
+        "# 提前结束报告\n结论(素材1)。",
+    ]
+    values, _next = _run_hitl_graph(outputs, resume="stop")
+    assert "提前结束报告" in values.get("final_report") or ""
+    assert int(values.get("iteration_count") or 0) == 1       # 停在第一轮
+    assert len(values.get("collected_info") or []) == 1

@@ -42,10 +42,26 @@ from core.history_store import (  # 历史 JSON 持久化 / 记录构造 / 文�
     save_report_history_to_disk as _save_report_history_to_disk,
 )
 from core.ingest import ingest_upload as _ingest_upload  # 上传文件预读为素材
+from core.config import env_flag as _env_flag, env_int as _env_int  # 统一配置解析
+from core.report_verifier import (  # 报告引用一致性校验(v1.6.0 防幻觉闭环)
+    citation_check_mark as _citation_check_mark,
+    verify_report_citations as _verify_report_citations,
+)
+from memory.vector_memory import (  # 长期记忆/RAG(v1.6.0 接入, 容错降级)
+    get_memory_store as _get_memory_store,
+    get_memory_store_error as _get_memory_store_error,
+)
 
 from logging_setup import get_logger
 
 _logger = get_logger("main")
+
+# ---- 长期记忆/RAG 配置(MEMORY_ENABLED=false 整体关闭, 见 .env.example) ----
+MEMORY_ENABLED = _env_flag("MEMORY_ENABLED", True)   # 默认开启; ChromaDB 不可用时自动降级
+MEMORY_TOP_K = _env_int("MEMORY_TOP_K", 3)           # 历史记忆/文档片段检索条数
+
+# ---- HITL(Human-in-the-loop)配置(默认关闭, 与旧行为完全一致; 见 .env.example) ----
+HUMAN_IN_THE_LOOP = _env_flag("HUMAN_IN_THE_LOOP", False)  # 反思"继续搜集"前暂停, 等人工确认
 
 
 # 页面配置必须在任何 st 组件之前
@@ -60,6 +76,9 @@ st.set_page_config(page_title="本地个人调研Agent", page_icon="🔎", layou
 # 已知限制(沿用旧版): 单用户本地原型, report_history.json 中存放的是全部历史报告的完整文本。
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 项目根目录
 REPORT_HISTORY_FILE = os.path.join(BASE_DIR, "report_history.json")  # 历史报告持久化载体(仅此一个文件)
+
+# ---- 长期记忆单例(进程级, 初始化失败返回 None → 全程无记忆模式, 不阻断主流程) ----
+_memory_store = _get_memory_store() if MEMORY_ENABLED else None
 
 if "report_history" not in st.session_state:
     # 每个元素的结构:
@@ -113,6 +132,7 @@ try:
         ALLOW_CODE_EXEC, DEFAULT_MODEL, MAX_ITERATIONS, build_graph, build_llm,
     )
     from langgraph.checkpoint.memory import InMemorySaver  # 异常兜底: 取回已搜集素材
+    from langgraph.types import Command  # HITL: 人工确认后以 Command(resume=...) 恢复执行
     from tools.search_tool import bocha_web_search  # 联网搜索: 博查(Bocha) API
 except Exception as exc:  # noqa: BLE001
     st.error(f"依赖导入失败, 请先安装依赖: pip install -r requirements.txt\n\n原始错误:\n{exc}")
@@ -135,6 +155,54 @@ MAX_FILE_SIZE_MB = 30  # 单个上传文件大小上限
 #   _preview_csv    → core.ingest.preview_csv(file_path)
 #   _ingest_upload  → core.ingest.ingest_upload(fname)(本文件顶部别名 _ingest_upload)
 # 本文件只保留上传大小校验与页面交互逻辑。
+
+
+# ============================ HITL 辅助(人工确认, v1.6.0, 可选) ============================
+def _get_hitl_interrupt_payload(graph, config):
+    """检查图是否暂停在人工确认点; 是则返回 interrupt 载荷 dict, 否则返回 None。
+
+    说明: LangGraph 节点调用 interrupt() 后, 本次 stream 正常结束(非异常),
+    graph.get_state(config).next 会指向 confirmation_node, 且 state.tasks[].interrupts
+    携带节点抛出的载荷(round/materials_count/reflection/question)。
+    """
+    try:
+        _now_state = graph.get_state(config)
+        if not _now_state.next or "confirmation_node" not in _now_state.next:
+            return None
+        for _task in (getattr(_now_state, "tasks", None) or []):
+            for _iv in (getattr(_task, "interrupts", None) or []):
+                _value = getattr(_iv, "value", None)
+                if isinstance(_value, dict) and _value.get("type") == "human_confirmation":
+                    return _value
+        return None
+    except Exception:  # noqa: BLE001 —— 中断检查失败按"无中断"处理, 不阻断
+        return None
+
+
+def _ask_human_confirmation(payload: dict) -> None:
+    """展示人工确认 UI(反思判定信息不足, 任务暂停等用户决策)。
+
+    按钮 onClick 把决策写入 st.session_state["hitl_decision"], 随后 st.stop() 挂起;
+    Streamlit rerun 后, 执行区读取该决策并以 Command(resume=决策) 恢复图执行。
+    (StopException 继承 BaseException, 不会被外层 except Exception 捕获, 不会误入
+    任务异常路径; 见执行区"hitl_thread 恢复"分支。)
+    """
+    round_no = int(payload.get("round") or 0)
+    materials_count = int(payload.get("materials_count") or 0)
+    reflection = str(payload.get("reflection") or "")
+    st.warning(f"⏸ **人工确认(第 {round_no} 轮反思判定信息不足, 已收集 {materials_count} 条素材)**")
+    if reflection:
+        with st.expander("查看反思意见", expanded=False):
+            st.text(reflection[:800])
+    col1, col2 = st.columns(2)
+    with col1:
+        st.button("▶ 继续搜集", key=f"hitl_continue_{round_no}", use_container_width=True,
+                  on_click=lambda: st.session_state.__setitem__("hitl_decision", "continue"))
+    with col2:
+        st.button("⏹ 停止并生成报告", key=f"hitl_stop_{round_no}", use_container_width=True,
+                  on_click=lambda: st.session_state.__setitem__("hitl_decision", "stop"))
+    st.caption("任务已暂停: 点击上方按钮恢复执行; 不点击则保持暂停(可安全离开页面)。")
+    st.stop()   # 挂起脚本; 按钮触发 rerun 后, 执行区读取 hitl_decision 恢复
 
 
 # ============================ 图执行与实时日志 ============================
@@ -199,15 +267,19 @@ def _salvage_run_materials(exc: Exception, graph, config, user_query: str,
                           type(exc).__name__, exc2)
 
 
-def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | None = None):
+def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | None = None,
+                      hitl_decision: str | None = None):
     """
     运行 LangGraph 主流程并实时展示每一步:
-    返回 (最终报告, 轮次, 素材总数, 生成图表路径列表)
+    返回 (最终报告, 轮次, 素材总数, 生成图表路径列表, 最终素材列表)
 
     :param resume_thread_id: 传入已存在的会话 thread_id 时进入"断点续研"模式 ——
         以 None 作为图输入, LangGraph 从 sqlite 中该会话最后一个完成的 checkpoint
         继续执行(中断的节点会重跑), 不重新预读上传文件(素材/上传清单在 checkpoint 内);
         默认 None = 与旧版完全一致的新建空白会话(先预读上传文件, 再带初始 State 起跑)。
+    :param hitl_decision: 非 None = 人工确认(Human-in-the-loop)恢复 —— 以
+        Command(resume=hitl_decision) 从中断点继续执行(确认按钮写入 session_state);
+        默认 None = 正常新建/断点续研流程。
     """
     # ---- 0. 初始化 State: 上传文件先自动预读为素材 ----
     # 注(断点续研): 恢复历史会话时跳过文件预读 —— uploaded_files 清单与已预读素材都在
@@ -219,6 +291,16 @@ def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | Non
             material, log_line = _ingest_upload(fname)
             if material:
                 initial_materials.append(material)
+                # 长期记忆/RAG(v1.6.0): 上传文件全文分块向量化入库, 供后续任务按主题检索
+                # (大文件不再只靠全文预览; 保存失败只记日志, 不影响本次任务)
+                if _memory_store is not None:
+                    try:
+                        saved = _memory_store.save_document(fname, material)
+                        if saved:
+                            _logger.info("上传文档已分块入库记忆库: %s (%d 块)", fname, saved)
+                    except Exception as exc:  # noqa: BLE001
+                        _logger.warning("上传文档分块入库失败(不影响本次任务): %s: %s",
+                                        type(exc).__name__, exc)
             logs.append(log_line)
         for line in logs:
             st.markdown(f"📎 {line}")
@@ -276,46 +358,68 @@ def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | Non
             else:
                 thread_id = uuid.uuid4().hex[:12]
         config = {"configurable": {"thread_id": thread_id}}
-        graph = build_graph(llm, web_search_tool=bocha_web_search, checkpointer=checkpointer)  # 博查API联网搜索
-        run_input = None if resume_thread_id is not None else initial_state  # 恢复会话: 从 checkpoint 续跑
-        for event in graph.stream(run_input, config=config, stream_mode="updates"):
-            for node_name, payload in event.items():
-                if node_name.startswith("__"):
-                    continue  # 跳过 LangGraph 内部节点
+        graph = build_graph(llm, web_search_tool=bocha_web_search, checkpointer=checkpointer,
+                            memory_store=_memory_store, memory_run_top_k=MEMORY_TOP_K,
+                            human_in_the_loop=HUMAN_IN_THE_LOOP)  # 博查API联网搜索 + 长期记忆/RAG + HITL
+        # 输入三态: HITL 恢复 = Command(resume=决策); 断点续研 = None(从 checkpoint 续跑);
+        #           新建任务 = initial_state(带预读素材起跑)
+        if hitl_decision is not None:
+            run_input = Command(resume=hitl_decision)
+        elif resume_thread_id is not None:
+            run_input = None
+        else:
+            run_input = initial_state
+        while True:   # 外层循环: 每次 HITL 恢复后继续流式执行, 直到任务完成
+            for event in graph.stream(run_input, config=config, stream_mode="updates"):
+                for node_name, payload in event.items():
+                    if node_name.startswith("__"):
+                        continue  # 跳过 LangGraph 内部节点
 
-                icon_title = _NODE_ICONS.get(node_name, node_name)
-                st.markdown(f"**▶ {icon_title}**")
+                    icon_title = _NODE_ICONS.get(node_name, node_name)
+                    st.markdown(f"**▶ {icon_title}**")
 
-                # 1) 实时日志行
-                for line in payload.get("steps_log") or []:
-                    st.markdown(f"- {line}")
+                    # 1) 实时日志行
+                    for line in payload.get("steps_log") or []:
+                        st.markdown(f"- {line}")
 
-                # 2) 规划结果: 展示子任务列表
-                if node_name == "planner_node" and payload.get("sub_tasks"):
-                    for i, task in enumerate(payload["sub_tasks"], start=1):
-                        st.markdown(f"  🎯 子任务{i}: {task}")
+                    # 2) 规划结果: 展示子任务列表
+                    if node_name == "planner_node" and payload.get("sub_tasks"):
+                        for i, task in enumerate(payload["sub_tasks"], start=1):
+                            st.markdown(f"  🎯 子任务{i}: {task}")
 
-                # 3) 工具节点: 展示本轮新增素材片段 + 进度条
-                if node_name == "tool_node":
-                    for entry in payload.get("collected_info") or []:
-                        with st.expander("查看本轮素材片段(前 1200 字)", expanded=False):
-                            st.text(str(entry)[:1200])
-                    max_round = int(payload.get("iteration_count") or max_round)
-                    added = payload.get("collected_info") or []
-                    total_materials += len(added)
-                    fallback_materials.extend(added)   # 增量追踪, 供异常兜底使用
-                    progress_bar.progress(min(max_round / MAX_ITERATIONS, 1.0))
+                    # 3) 工具节点: 展示本轮新增素材片段 + 进度条
+                    if node_name == "tool_node":
+                        for entry in payload.get("collected_info") or []:
+                            with st.expander("查看本轮素材片段(前 1200 字)", expanded=False):
+                                st.text(str(entry)[:1200])
+                        max_round = int(payload.get("iteration_count") or max_round)
+                        added = payload.get("collected_info") or []
+                        total_materials += len(added)
+                        fallback_materials.extend(added)   # 增量追踪, 供异常兜底使用
+                        progress_bar.progress(min(max_round / MAX_ITERATIONS, 1.0))
 
-                # 4) 反思节点: 高亮结论
-                if node_name == "reflection_node" and payload.get("reflection"):
-                    reflection_text = str(payload["reflection"])
-                    marker = "✅ 反思结论(信息充足)" if "任务信息充足" in reflection_text or "信息充足" in reflection_text else "⚠️ 反思结论(继续搜集)"
-                    with st.expander(f"{marker}: 查看完整反思", expanded=False):
-                        st.text(reflection_text)
+                    # 4) 反思节点: 高亮结论
+                    if node_name == "reflection_node" and payload.get("reflection"):
+                        reflection_text = str(payload["reflection"])
+                        marker = "✅ 反思结论(信息充足)" if "任务信息充足" in reflection_text or "信息充足" in reflection_text else "⚠️ 反思结论(继续搜集)"
+                        with st.expander(f"{marker}: 查看完整反思", expanded=False):
+                            st.text(reflection_text)
 
-                # 5) 报告节点: 暂存报告, 最后统一渲染
-                if node_name == "report_node" and payload.get("final_report"):
-                    final_report = str(payload["final_report"])
+                    # 5) 报告节点: 暂存报告, 最后统一渲染
+                    if node_name == "report_node" and payload.get("final_report"):
+                        final_report = str(payload["final_report"])
+
+            # ---- HITL(可选): 检查是否暂停在人工确认点 ----
+            # 反思判定"继续搜集"时, confirmation_node 调用 interrupt 暂停: 本次 stream
+            # 正常结束, graph.get_state().next 指向 confirmation_node。展示确认 UI 并
+            # st.stop() 挂起; 用户点击按钮(rerun)后, 执行区以 hitl_decision 恢复执行。
+            if HUMAN_IN_THE_LOOP:
+                hitl_payload = _get_hitl_interrupt_payload(graph, config)
+                if hitl_payload is not None:
+                    st.session_state["hitl_thread"] = thread_id      # 恢复上下文: thread
+                    st.session_state["hitl_topic"] = user_query      # 恢复上下文: 主题
+                    _ask_human_confirmation(hitl_payload)            # 内部 st.stop(), 不会返回
+            break  # 无中断(或未启用 HITL): 任务执行完毕, 退出循环
     except Exception as exc:  # noqa: BLE001 —— P0-4: 全部异常路径统一走素材落盘兜底
         _salvage_run_materials(exc, graph, config, user_query, fallback_materials)
         raise  # 原始异常继续抛出, 由外层(main 执行区)统一渲染错误提示
@@ -353,7 +457,19 @@ def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | Non
         except Exception as exc4:  # noqa: BLE001 —— 登记失败只记录, 不阻断本次结果
             _logger.warning("会话登记落账失败(thread_id=%s): %s", thread_id, exc4)
 
-    return final_report, used_rounds, total_materials, new_images
+    # ---- 收集最终素材列表(供长期记忆 save_run / 报告引用校验使用) ----
+    # 优先取 checkpointer 最终状态(含记忆检索注入素材), 失败退回本地事件流追踪素材。
+    final_materials = list(fallback_materials)
+    if graph is not None and config is not None:
+        try:
+            _st_final = graph.get_state(config)
+            _st_values = getattr(_st_final, "values", None) or {}
+            if isinstance(_st_values, dict) and _st_values.get("collected_info"):
+                final_materials = list(_st_values["collected_info"])
+        except Exception:  # noqa: BLE001 —— 读数失败不影响结果展示
+            pass
+
+    return final_report, used_rounds, total_materials, new_images, final_materials
 
 
 # ============================ 📜 历史记录辅助(实现见 core/history_store.py) ============================
@@ -398,6 +514,17 @@ with st.sidebar:
         st.write("✅ 联网搜索: 博查(Bocha) Web Search API 已配置")
     else:
         st.write("❌ 联网搜索: 未配置 BOCHA_API_KEY(联网搜索将不可用)")
+    # ---- 长期记忆/RAG 状态(v1.6.0): ChromaDB 可用性一目了然 ----
+    if _memory_store is not None:
+        st.write(f"✅ 长期记忆/RAG: ChromaDB 已启用(共 {_memory_store.count()} 条向量记录)")
+    else:
+        _mem_reason = _get_memory_store_error()
+        st.write("❌ 长期记忆/RAG: 未启用("
+                 + ("MEMORY_ENABLED=false" if not MEMORY_ENABLED else "ChromaDB 不可用")
+                 + (f": {_mem_reason}" if _mem_reason else "") + ")")
+    # ---- HITL(Human-in-the-loop)状态(v1.6.0, 默认关闭) ----
+    if HUMAN_IN_THE_LOOP:
+        st.write("✅ 人工确认(HITL): 已启用(反思判定不足时将暂停, 由你决定继续/停止)")
     st.divider()
     st.subheader("🛡️ 安全边界")
     st.write(f"- 工具最多迭代 {MAX_ITERATIONS} 轮, 到达上限自动生成报告")
@@ -521,12 +648,25 @@ uploaded_files = st.file_uploader(
 start_clicked = st.button("🚀 开始调研", type="primary", use_container_width=True)
 
 # ---------- 执行区 ----------
-if start_clicked:
+# HITL 恢复: 上轮任务暂停在人工确认点、用户点击按钮后 rerun —— hitl_thread 是暂停会话
+# 的 thread_id, hitl_decision 是按钮写入的决策("continue"/"stop"), 取出即清(每次恢复消费一次)。
+hitl_thread = st.session_state.get("hitl_thread")
+hitl_decision = st.session_state.pop("hitl_decision", None)
+
+if start_clicked or hitl_thread:
     # ---- 断点续研: 解析侧边栏会话选择(默认不选 = 新建空白会话, 与旧版表现完全一致) ----
     resume_store = _agent_store()
     resume_thread_id = None
     resume_session_info = None
-    if resume_store is not None:
+    if hitl_thread:
+        # HITL 恢复: 直接用暂停会话的 thread_id 续跑(素材/轮次/上传清单都在 checkpoint 内,
+        # 本次不上传不预读), 以 Command(resume=hitl_decision) 从中断点继续。
+        resume_thread_id = hitl_thread
+        topic = str(st.session_state.get("hitl_topic") or "").strip() or (user_query or "").strip()
+        fnames = []
+        st.info(f"⏸ 从人工确认点恢复执行(会话 {resume_thread_id[:8]}…): "
+                f"已搜集素材/轮次从 checkpoint 恢复, 按你的选择继续。")
+    elif resume_store is not None:
         chosen_tid = st.session_state.get("agent_resume_thread")
         if chosen_tid:
             chosen_info = resume_store.get_session(chosen_tid)
@@ -579,10 +719,15 @@ if start_clicked:
         status = None
         try:
             with st.status("⏳ 任务执行中……", expanded=True) as status:
-                # resume_thread_id 非空 = 从该会话 checkpoint 继续执行(断点续研)
-                report, used_rounds, material_count, images = _render_graph_run(
-                    topic, fnames, resume_thread_id=resume_thread_id or None)
+                # resume_thread_id 非空 = 从该会话 checkpoint 继续执行(断点续研/HITL 恢复)
+                report, used_rounds, material_count, images, final_materials = _render_graph_run(
+                    topic, fnames, resume_thread_id=resume_thread_id or None,
+                    hitl_decision=hitl_decision)
                 status.update(label=f"✅ 执行完成(共 {used_rounds} 轮, {material_count} 条素材)", state="complete", expanded=False)
+
+            # 成功跑完: 清理 HITL 恢复上下文(防止旧状态干扰下一次新建任务)
+            st.session_state.pop("hitl_thread", None)
+            st.session_state.pop("hitl_topic", None)
 
             # 存入 session_state, 后续任何页面交互都不会丢失本次结果
             st.session_state["last_run"] = {
@@ -592,16 +737,31 @@ if start_clicked:
                 "images": images,
                 "query": topic,
                 "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "materials": final_materials,   # 供结果区"引用一致性校验"使用
             }
 
             # ---- 调研完整跑完, 拿到 final_report 后自动存入历史(内存 + 同步落盘 json) ----
             # 说明: 函数内部先插入 session_state 内存历史, 再把完整列表覆盖写入 report_history.json。
             _save_report_to_history(topic, report)   # 新报告插到最顶部, 最多保留 20 条, 持久化到本地
+
+            # ---- 长期记忆回写(v1.6.0): 任务完成后把本次调研存入向量库, 供未来相似主题复用 ----
+            # 检索侧由图首的 memory_retrieve_node 承担(见 graph_builder.build_graph);
+            # 保存失败只记日志, 不影响本次结果展示。
+            if _memory_store is not None and report:
+                try:
+                    _memory_store.save_run(topic, final_materials, report)
+                    _logger.info("长期记忆已保存: 「%s」(%d 条素材入库)", topic, len(final_materials))
+                except Exception as exc5:  # noqa: BLE001 —— 记忆保存失败不阻断
+                    _logger.warning("长期记忆保存失败(不影响本次结果): %s", exc5)
+
             _delete_uploaded_files(fnames)           # 任务结束: 自动清理本次上传文件的磁盘副本
             st.session_state.pop("last_salvage", None)  # 成功后清掉上一次的异常兜底提示
             st.session_state.pop("last_salvage_error", None)
             _logger.info("调研完成: 「%s」 共 %s 轮 / %s 条素材", topic, used_rounds, material_count)
         except Exception as exc:  # 捕获 LLM 网络错误 / JSON 重试失败 / Key 未配置等, 给出友好提示
+            # 异常终止: 清理 HITL 恢复上下文(该会话已失败, 不让下次 rerun 误恢复)
+            st.session_state.pop("hitl_thread", None)
+            st.session_state.pop("hitl_topic", None)
             if status is not None:
                 status.update(label="❌ 任务异常终止", state="error")
             st.error(f"任务终止: {exc}")
@@ -646,6 +806,16 @@ if last_run:
     st.caption(f"主题: {last_run['query']}　|　完成时间: {last_run['finished_at']}　"
                f"|　工具轮次: {last_run['used_rounds']}/{MAX_ITERATIONS}　|　素材条数: {last_run['material_count']}")
     st.markdown(last_run["report"])
+
+    # ---- 报告引用一致性校验(v1.6.0 防幻觉闭环): 自动核对【素材N】编号是否真实存在 ----
+    # 确定性检查(不调用 LLM): 报告引用编号必须落在本次素材范围内; 结果如实展示,
+    # 无效引用不阻断展示(模型偶发不规范时提示用户注意, 而非静默重跑)。
+    if last_run.get("materials") is not None:
+        try:
+            _cite_check = _verify_report_citations(last_run["report"], last_run["materials"])
+            st.markdown(_citation_check_mark(_cite_check))
+        except Exception:  # noqa: BLE001 —— 校验失败不阻断报告展示
+            pass
 
     if last_run["images"]:
         st.subheader("📊 代码生成的图表")

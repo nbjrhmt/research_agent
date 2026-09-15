@@ -2,6 +2,63 @@
 
 本项目变更记录。版本号规则: 语义化版本(主.次.修订)。
 
+## [1.6.0] - 2026-09-15 — 长期记忆/RAG + FastAPI 服务化 + 引用校验 + 人工确认(HITL)
+
+> 本轮目标(增量开发): 在不动既有业务逻辑的前提下补齐四大增量 ——
+> ① ChromaDB 长期记忆与文档分块检索(RAG, 跨任务复用历史素材);
+> ② FastAPI 把 Agent 封装为 REST 服务(server.py, 可脱离 Streamlit 独立部署);
+> ③ 报告引用一致性校验(素材编号可追溯); ④ Human-in-the-loop 人工确认闸门。
+> 既有节点逻辑 / 断点续研 / 素材兜底 / 全部既有测试均保持行为不变。
+
+### 🟢 新增功能
+
+1. **长期记忆 + 文档检索(RAG)(核心)**
+   - 新增 `memory/vector_memory.py`: `MemoryStore`(ChromaDB cosine)统一管理两类记忆
+     —— `save_run`(历史调研任务记忆)与 `save_document`(上传文档全文分块入库);
+     `chunk_text` 纯函数(默认 800 字符/块、100 字符重叠);
+   - 图首新增 `memory_retrieve_node`(graph_builder.build_graph 传入 memory_store 时插入
+     START 与 planner 之间): 任务开始前按主题检索相似历史记忆/文档片段注入素材,
+     检索失败只记日志不阻断;
+   - 任务完成后调用方回写 `save_run(topic, materials, report)`, 形成"检索→执行→回写"
+     长期记忆闭环; `main.py` 新增 `MEMORY_ENABLED`(默认 true, ChromaDB 不可用自动降级)/
+     `MEMORY_TOP_K` 配置; 侧边栏显示记忆库状态。
+
+2. **FastAPI 服务化(核心)**
+   - 新增 `server.py`: `POST /api/research`(JSON)、`POST /api/research/with-files`
+     (multipart 上传 PDF/CSV)、`GET /api/research/{task_id}`(结果查询)、
+     `GET /api/research`(任务列表, 按 seq 倒序)、`GET /health`;
+   - `TaskStore`(内存 dict + 锁 + 自增 seq)管理异步任务, `ThreadPoolExecutor` 后台执行
+     完整图流程(InMemorySaver + 长期记忆), 结果含报告/轮次/素材/引用校验标记;
+     启动命令 `uvicorn server:app --port 8000`(见 README §快速开始)。
+
+3. **报告引用一致性校验**
+   - 新增 `core/report_verifier.py`: 从报告正文提取「素材N」引用(兼容【】/〔〕/()/（）/
+     裸编号/页码后缀), 校验编号越界/重复, 在 Streamlit 报告区与 API 响应中显示
+     ✅/⚠️ 校验标记。
+
+4. **Human-in-the-loop 人工确认(可选, 默认关闭)**
+   - `graph_builder` 新增 `confirmation_node`(LangGraph `interrupt` 暂停)与
+     `route_after_confirmation` 纯函数; `build_graph(..., human_in_the_loop=True)` 启用后,
+     反思判定"信息不足"时任务暂停, 调用方展示确认 UI, 以 `Command(resume=continue/stop)`
+     恢复(继续搜集 / 停止出报告); `main.py` 新增 `HUMAN_IN_THE_LOOP` 配置与确认面板。
+
+5. **单元测试**
+   - 新增 `tests/test_vector_memory.py`(15 条)、`tests/test_api.py`(8 条)、
+     `tests/test_report_verifier.py`(13 条), `test_graph_builder.py` 追加记忆检索 6 条 +
+     HITL 5 条; 全量 `python -m pytest tests` → **172 passed**(约 45s)。
+
+6. **依赖与文档**
+   - `requirements.txt` 新增 `fastapi>=0.110.0` / `uvicorn>=0.29.0`(chromadb/langgraph
+     既有); `.env.example` 补充 `MEMORY_ENABLED` / `MEMORY_TOP_K` / `MEMORY_CHUNK_SIZE` /
+     `MEMORY_CHUNK_OVERLAP` / `HUMAN_IN_THE_LOOP` 说明; 版本号升至 1.6.0。
+
+### 🟧 兼容性说明
+
+- 全部增量默认关闭或与旧行为等价: 不传 memory_store / human_in_the_loop=False 时,
+  图与 1.5.0 完全一致; server.py 为新增独立入口, 不影响 Streamlit 主流程;
+- 长期记忆为本地单机 ChromaDB(单进程使用), 持久化目录默认 `./chroma_db`, 已加入
+  `.gitignore`; API 服务为演示级(内存任务队列, 重启即失), 见 README「已知项目局限」。
+
 ## [1.5.0] - 2026-09-08 — Agent 会话 SqliteSaver 状态持久化(断点续研)
 
 > 本轮目标(增量开发): 在不动既有业务逻辑的前提下, 为 LangGraph Agent 会话接入

@@ -4,13 +4,13 @@
 
 > 一个把 **LLM 大模型 + 任务规划 + 多轮反思迭代 + 联网搜索 + 工具调用** 串起来的本地调研 Agent 个人实践项目。
 
-**⚡ 核心特性速览(2026.09 重构版 v1.4.0)**
+**⚡ 核心特性速览(2026.09 重构版 v1.6.0)**
 
 - 🤖 **LangGraph 状态机编排**: 规划 → 工具调用 → 反思 → 再搜集/报告的**多轮自主迭代闭环**(反思结构化判定 + 轮次/失败双上限收敛, 不依赖自由文本路由);
 - 🛠 **三类工具 + 双层沙盒**: 博查联网搜索 / PDF 解析 / 受限代码执行(静态黑名单 → 子进程隔离 → 运行时真实路径白名单 → 超时强杀);
-- 📐 **引擎与 UI 分层**: `core/` 核心服务层(config / history_store / file_store / ingest)与 Streamlit 界面解耦, 纯逻辑不依赖 UI、可独立单测;
-- 📝 **防幻觉与上下文治理**: 报告结论强制标注【素材N】+ 来源 URL; tiktoken 真实预算 + 反思"先判断、后截断";
-- 🧪 **工程质量**: **126 条离线单测**(零 API 消耗, CI 自动执行)+ pytest-cov 覆盖率(core 层 ≈94%)+ ruff + 依赖锁一致性校验;
+- 📐 **引擎与 UI 分层**: `core/` 核心服务层(config / history_store / file_store / ingest / report_verifier)与 Streamlit 界面解耦, 纯逻辑不依赖 UI、可独立单测;
+- 📝 **防幻觉与上下文治理**: 报告结论强制标注【素材N】+ 来源 URL, 并做**引用一致性校验**(v1.6.0); tiktoken 真实预算 + 反思"先判断、后截断";
+- 🧪 **工程质量**: **172 条离线单测**(零 API 消耗, CI 自动执行)+ pytest-cov 覆盖率(core 层 ≈94%)+ ruff + 依赖锁一致性校验;
 - 🚀 **可部署**: Dockerfile 一键容器化(密钥环境变量注入、不打包 .env)+ Streamlit 默认配置开箱即用。
 
 > ⚠️ **定位与安全边界(一句话)**: 单用户本地原型项目, 自带代码沙盒**非生产级安全沙箱**——仅限本机/可信内网演示使用, **禁止公网 / 多租户部署**; 完整声明见 [§8 已知项目局限](#8-已知项目局限如实说明)。
@@ -174,7 +174,7 @@
    【工具异常】素材如实进入报告"资料获取情况"章节。收益: 迭代一定终止、结论可逐条溯源。
 
 6. **工程自动化: 双 CI + 全量离线单测体系, 质量门禁前置**
-   e2e 会真实消耗 LLM/搜索 API, 不适合 CI 频繁执行。方案: 建立 **126 条全离线 pytest 用例(2026 P2 扩至 core/tools 层)**
+   e2e 会真实消耗 LLM/搜索 API, 不适合 CI 频繁执行。方案: 建立 **172 条全离线 pytest 用例(2026 P2 扩至 core/tools 层, v1.6.0 再扩至记忆/API/校验/HITL)**
    (注入假 LLM/假搜索, 零 API 消耗), 用 `pytest.ini` 只收集 `test_*.py` 把耗额度测试隔离在 CI 外;
    GitHub Actions 与 GitLab CI 双平台等价流水线(离线单测 → ruff lint → 锁文件一致性校验,
    由 `scripts/check_lock_consistency.py` 无网络校验 requirements.txt 与 lock 文件约束);
@@ -203,7 +203,9 @@ requests           # 博查 Web Search API 请求
 pypdf              # PDF 文本提取
 pandas             # CSV 分析与预览
 matplotlib         # 数据分析绘图
-chromadb           # 长期记忆预留模块依赖(当前未启用)
+chromadb           # ChromaDB 向量库(长期记忆/RAG, v1.6.0 启用, 本地持久化 ./chroma_db)
+fastapi            # REST API 服务化(server.py, v1.6.0 新增)
+uvicorn            # FastAPI 启动器(server.py, v1.6.0 新增)
 python-dotenv      # 读取根目录 .env
 tiktoken           # 素材按真实 token 预算裁剪(替代纯字符截断)
 ```
@@ -237,8 +239,11 @@ copy .env.example .env
 # macOS / Linux:
 # cp .env.example .env
 
-# ④ 启动应用(默认地址 http://localhost:8501)
+# ④ 启动 Web 应用(默认地址 http://localhost:8501)
 streamlit run main.py
+
+# ④-可选 API 服务(v1.6.0): 同一 Agent 以 REST 方式调用(默认 http://localhost:8000, 见 README §6 示例)
+uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 ### 5.1 Docker 部署(可选, 2026 P3 新增)
@@ -247,18 +252,22 @@ streamlit run main.py
 > 安全边界同顶部声明——仅限本机/可信内网, 禁止公网部署。
 
 ```bash
-# 构建(镜像名建议带版本号, 与 pyproject/CHANGELOG 的 1.4.0 对齐)
-docker build -t research-agent:1.4.0 .
+# 构建(镜像名建议带版本号, 与 pyproject/CHANGELOG 的 1.6.0 对齐)
+docker build -t research-agent:1.6.0 .
 
 # 运行方式一: 逐项环境变量注入
-docker run -d --name research-agent -p 8501:8501   -e OPENAI_API_KEY=sk-xxx   -e OPENAI_BASE_URL=https://api.deepseek.com/v1   -e LLM_MODEL=deepseek-chat   -e BOCHA_API_KEY=sk-xxx   research-agent:1.4.0
+docker run -d --name research-agent -p 8501:8501   -e OPENAI_API_KEY=sk-xxx   -e OPENAI_BASE_URL=https://api.deepseek.com/v1   -e LLM_MODEL=deepseek-chat   -e BOCHA_API_KEY=sk-xxx   research-agent:1.6.0
 
 # 运行方式二: --env-file 注入(注意 .env 不要提交到仓库/打入镜像)
-docker run -d --name research-agent -p 8501:8501 --env-file .env research-agent:1.4.0
+docker run -d --name research-agent -p 8501:8501 --env-file .env research-agent:1.6.0
 ```
 
 - 容器内默认 `127.0.0.1:8501` 映射到宿主 `localhost:8501`, 浏览器访问 `http://localhost:8501`;
 - 需要持久化历史/素材时挂载 volume: `-v research_data:/app/temp_upload`(report_history.json 位于 /app 根, 可按需另行挂载);
+- **长期记忆 + 文档检索(RAG, v1.6.0)**: ChromaDB 向量库统一管理两类记忆 —— 历史调研任务(save_run)与上传文档全文分块(save_document, 默认 800 字符/块、100 字符重叠); 新任务开始时图首的 memory_retrieve_node 按主题检索相似历史素材自动注入, 任务完成后回写, 形成「检索→执行→回写」跨任务记忆闭环; `MEMORY_ENABLED=false` 可整体关闭(ChromaDB 不可用时自动降级),侧边栏实时显示记忆库状态;
+- **报告引用一致性校验(v1.6.0)**: 报告正文提取「素材N」引用(兼容【】/〔〕/()/（）/裸编号/页码后缀),校验编号越界/重复, 在报告区与 API 响应中显示 ✅/⚠️ 标记, 让「结论可溯源」可被机器复核;
+- **FastAPI 服务化(v1.6.0)**: `server.py` 把同一 Agent 封装为 REST 服务(异步任务队列 + 素材引用校验),支持 JSON 与 multipart 上传, `uvicorn server:app --port 8000` 独立启动, 便于接入其他应用/演示 API 能力;
+- **人工确认闸门 HITL(v1.6.0, 默认关闭)**: 反思判定「信息不足」时任务暂停(LangGraph interrupt),页面展示反思意见与「继续搜集 / 停止出报告」按钮, 以 Command(resume=...) 恢复 ——把「是否值得继续消耗 API」的决策交还给人, 避免无监督空转;
 - **Agent 会话 checkpoint 持久化(断点续研, v1.5.0)**: 数据库文件 `agent_checkpoints.db` 为**运行时文件, 不打包进镜像**, 容器内需挂载宿主目录并指向它, 例如:
   ```bash
   docker run -d --name research-agent -p 8501:8501 \
@@ -342,7 +351,7 @@ BOCHA_API_KEY=sk-你的博查API_Key
 - **Agent 会话 checkpoint 持久化(断点续研, v1.5.0)**: Agent 运行中间状态经 LangGraph **SqliteSaver** 写入本地 sqlite 文件 `agent_checkpoints.db`(可用 `CHECKPOINT_DB_PATH` 覆盖路径, `CHECKPOINT_PERSIST=false` 可整体退回旧的纯内存模式); 任务中断 / 程序重启后, 侧边栏「🗂️ Agent 会话(断点续研)」可列出历史会话, 选中"中断/进行中"会话再点「开始调研」即可从断点恢复继续执行未完成的调研(已搜集素材/子任务/轮次计数均从 checkpoint 恢复); 默认"新建空白会话", 与旧版行为完全一致(详见 §8 与 `core/checkpoint_store.py`);
 - **临时文件自动清理**: 上传文件/图表按任务周期自动清理(`temp_upload/` 不无限膨胀);
 - **全异常路径素材兜底(不静默失败)**: LLM 重试全部失败 / 沙盒致命错误 / 搜索 API 报错 / 任务运行异常等任一异常, 已搜集素材(含上传预读素材)都会落盘 `temp_upload/partial_*.json` 并在页面给出提示 + 下载按钮; 无素材时也明确提示;
-- **离线单测 + CI**: 126 条 pytest 离线用例(不调用 LLM/搜索 API), 覆盖沙盒、token 裁剪/预算、反思解析、素材去重(原有 46 条)+ 2026 P2 新增的 core 层(统一配置/历史持久化/临时文件/上传预读)、search_tool 格式化、pdf_reader 离线分支等 67 条 + v1.5.0 新增 SqliteSaver 会话持久化 13 条; 本地 pytest-cov 度量: core 层约 94%、graph_builder 88%、整体约 78%(沙盒子进程运行器在子进程执行, 不计入统计, 命令见 §11.4); GitHub Actions 与 GitLab CI 自动跑测试 / ruff lint / 锁文件一致性(见 §9);
+- **离线单测 + CI**: 172 条 pytest 离线用例(不调用 LLM/搜索 API), 覆盖沙盒、token 裁剪/预算、反思解析、素材去重(原有 46 条)+ 2026 P2 新增的 core 层(统一配置/历史持久化/临时文件/上传预读)、search_tool 格式化、pdf_reader 离线分支等 67 条 + v1.5.0 新增 SqliteSaver 会话持久化 13 条 + v1.6.0 新增记忆 15 / 引用校验 13 / API 8 / HITL 5 条; 本地 pytest-cov 度量: core 层约 94%、graph_builder 88%、整体约 78%(沙盒子进程运行器在子进程执行, 不计入统计, 命令见 §11.4); GitHub Actions 与 GitLab CI 自动跑测试 / ruff lint / 锁文件一致性(见 §9);
 - **统一日志**: 标准 logging 模块输出到 `logs/app.log`(带时间戳/级别/异常堆栈, 自动轮转; 仅限单进程模式, 见 §8)。
 
 ## 8. 已知项目局限(如实说明)
@@ -363,6 +372,8 @@ BOCHA_API_KEY=sk-你的博查API_Key
 - 🐢 **未做高并发**: 未针对多用户同时跑调研做并发 / 排队设计, 同时多人使用可能出现资源竞争;
 - 🛡 **代码沙盒不是生产级沙箱(重要)**: 详见顶部「安全与部署边界声明」——静态黑名单仅是文本字面拦截(可被字符串拼接 / exec / eval / 动态 import / 变量别名绕过), 缺少 CPU / 内存 / fork 炸弹资源限制, 所有用户代码运行在同一 UID、仅目录隔离; 只应在可信环境运行、**禁止公网多租户部署**, 仅用于内部演示与本地使用;
 - 💾 **report_history.json 存放全部历史报告文本**: 历史报告的完整文本会明文保存在该文件中(含可能涉及的个人/敏感信息), 请妥善保管, 必要时手动删除该文件清空历史。
+- 🧠 **长期记忆为本地单机 ChromaDB(v1.6.0)**: 向量库默认持久化到 `./chroma_db/`(不入库), 单进程使用; 记忆检索基于 embedding 相似度, 仅作素材补充, 不代表"事实正确" —— 报告仍需人工核对; `MEMORY_ENABLED=false` 可整体关闭;
+- 🌐 **API 服务为演示级(v1.6.0)**: `server.py` 的任务队列为**进程内存**实现(重启即失, 不支持多进程/负载均衡), 且**没有鉴权** —— 与 Streamlit 页面同属"单用户本地原型"边界, 请勿直接暴露公网; 未启用断点持久化(HITL/断点续研走 Streamlit 页面的 SqliteSaver)。
 
 **工程边界备注(单进程假设, 多进程/多实例部署前必读):**
 
@@ -370,7 +381,7 @@ BOCHA_API_KEY=sk-你的博查API_Key
 - ♻️ **会话状态持久化已接入, 但仍是单进程边界(v1.5.0)**: Agent 运行中间状态默认经 LangGraph **SqliteSaver** 持久化到本地 sqlite 文件 `agent_checkpoints.db`(封装见 `core/checkpoint_store.py`, 数据库文件不入库/不打镜像); `CHECKPOINT_PERSIST=false` 或 langgraph-checkpoint-sqlite 依赖缺失 / 初始化失败时, 自动退回旧版 **InMemorySaver 内存模式**(仅存单进程内存, 服务重启/进程退出后运行状态即丢失, 任务异常素材靠 `temp_upload/partial_*.json` 兜底); 持久化模式为**单进程使用设计** —— 多进程/多实例并发写同一 db 文件不受支持(同 `temp_upload/` 清理竞争条件); 容器部署时需把 db 文件挂到宿主机 volume(见 §5.1);
 - 🧹 **temp_upload/ 清理竞争条件**: 上传文件 / 图表 / partial 成果共用 `temp_upload/` 全局目录, 清理逻辑(listdir 后逐个删除)无跨进程锁 —— 多进程/多实例并发时, 一个实例可能删除另一个实例正在使用的文件; 仅支持单进程模式(见 `main.py._cleanup_temp_files` 注释)。
 
-**迭代路线说明(各版本进展见 [CHANGELOG.md](CHANGELOG.md))**: Dockerfile 容器化部署(v1.4.0 已实现)、SqliteSaver 会话 checkpoint 持久化(v1.5.0 已实现; 后续可扩展 RedisSaver / PostgresSaver 以支持多实例)、ruff + black + isort 完整格式化 lint 配置、沙盒 CPU/内存/进程数资源限制(fork 炸弹防御)、素材语义去重(embedding 相似度)。
+**迭代路线说明(各版本进展见 [CHANGELOG.md](CHANGELOG.md))**: Dockerfile 容器化部署(v1.4.0 已实现)、SqliteSaver 会话 checkpoint 持久化(v1.5.0 已实现; 后续可扩展 RedisSaver / PostgresSaver 以支持多实例)、长期记忆/RAG + 引用校验 + API 服务化 + HITL 人工确认(v1.6.0 已实现)、ruff + black + isort 完整格式化 lint 配置、沙盒 CPU/内存/进程数资源限制(fork 炸弹防御)、素材语义去重(embedding 相似度)。
 
 ## 9. 项目文件目录说明
 
@@ -378,7 +389,9 @@ BOCHA_API_KEY=sk-你的博查API_Key
 research_agent/
 ├── main.py                  # Streamlit UI 壳(2026 P1 重构): 页面布局/输入上传交互/实时
 │                            #   日志渲染/历史面板/异常兜底展示; 纯业务逻辑已迁入 core/
-├── graph_builder.py         # LangGraph 图: State 图构建、四个节点(规划/工具/反思/报告)、
+├── server.py               # FastAPI 服务化(v1.6.0): 5 个路由 + 异步任务队列 + 引用校验,
+│                            #   uvicorn server:app --port 8000 启动(可脱离 UI 独立部署)
+├── graph_builder.py         # LangGraph 图: 规划/工具/反思/报告/记忆检索/人工确认节点、
 │                            #   结构化反思判定(先判断后截断 + 失败内部重试防空转)、token 预算
 ├── state_schema.py          # Agent State 数据结构(TypedDict, 含 reflection_sufficient /
 │                            #   reflection_failures 等判定与内部字段)
@@ -390,7 +403,8 @@ research_agent/
 │   │                         #   会话登记簿, 断点续研; 纯 core 层, v1.5.0 新增)
 │   ├── history_store.py      #   报告历史 JSON 持久化(容错读写 / 记录构造 / 下载文件名)
 │   ├── file_store.py         #   临时文件生命周期(上传落盘 / 清理 / partial 快照 / 图表发现)
-│   └── ingest.py             #   上传文件预读为素材(PDF 全文 / CSV 多编码结构预览)
+│   ├── ingest.py             #   上传文件预读为素材(PDF 全文 / CSV 多编码结构预览)
+│   └── report_verifier.py    #   报告引用一致性校验(素材编号提取/越界/重复, v1.6.0 新增)
 ├── .streamlit/config.toml    # Streamlit 默认配置(headless / 监听地址 / 端口 / 主题)
 ├── Dockerfile                # 容器镜像: 非 root 运行, 不打包 .env, 密钥环境变量注入
 ├── .dockerignore             # 构建上下文排除(密钥 / 缓存 / 测试 / 本地数据)
@@ -418,13 +432,20 @@ research_agent/
 │   ├── pdf_reader.py        #   PDF 全文提取
 │   ├── code_exec_tool.py    #   代码沙盒入口(文本黑名单 + 静态预检 + 子进程调度/超时强杀)
 │   └── _sandbox_runner.py   #   代码沙盒子进程运行器(受限内置函数 + 真实路径白名单)
-├── memory/                  # ChromaDB 长期记忆模块(预留, 当前未接入主流程)
-├── tests/                   # 离线单元测试(pytest, 不调用 LLM/搜索 API, CI 自动执行, 共 126 条):
+├── memory/                  # ChromaDB 长期记忆模块(v1.6.0 启用): MemoryStore(任务记忆/文档
+│                           #   分块入库)、chunk_text 纯函数、get_memory_store 进程级单例
+├── tests/                   # 离线单元测试(pytest, 不调用 LLM/搜索 API, CI 自动执行, 共 172 条):
 │   ├── conftest.py          #   路径引导 + workdir 临时目录 fixture(2026 P2/P4 新增)
 │   ├── test_graph_builder.py#   graph_builder 核心单测: token 裁剪/预算告警、反思 JSON 解析
 │   │                        #   与时序、素材去重、规划/报告/路由(31 条)
 │   ├── test_sandbox.py      #   代码沙盒回归: 黑名单/运行时路径白名单/超时强杀/图表/模板(15 条)
 │   │                        #   运行: python -m pytest tests  或  python tests/test_sandbox.py
+│   ├── test_vector_memory.py #   memory/vector_memory 长期记忆: 分块/入库/检索/单例降级
+│   │                        #   (15 条, v1.6.0 新增)
+│   ├── test_report_verifier.py # core/report_verifier 引用校验: 提取/越界/重复/标记
+│   │                        #   (13 条, v1.6.0 新增)
+│   ├── test_api.py         #   server.py FastAPI: 5 路由/异步任务/异常不抛出
+│   │                        #   (8 条, v1.6.0 新增)
 │   ├── test_config.py       #   core/config 统一配置解析(15 条, 2026 P2 新增)
 │   ├── test_checkpoint_store.py  # core/checkpoint_store 会话持久化: SqliteSaver/登记簿/
 │   │                        #   断点续研恢复(:memory: 内存 sqlite, 13 条, v1.5.0 新增)
@@ -451,14 +472,14 @@ research_agent/
 
 | 文件 | 职责 |
 | --- | --- |
-| `main.py` | 网页入口与"胶水层": 收集输入 → 调 LangGraph 主流程 → 实时渲染节点日志 → 结果 / 历史 / 下载 / 临时文件清理 / **全异常路径素材落盘兜底(P0-4)** / **Agent 会话选择与断点续研(v1.5.0)**; 历史 JSON 持久化也在此文件 |
-| `graph_builder.py` | Agent 业务核心: 规划 / 工具 / 反思 / 报告四个节点 + 反思后条件路由; **反思"先判断后截断"时序(P0-1)与 JSON 失败内部重试、连续失败防空转(P0-3)**; LLM 统一超时/重试与 token 预算; `build_graph` 支持可选 `checkpointer`(不传 = 纯内存, 旧行为不变) |
+| `main.py` | 网页入口与"胶水层": 收集输入 → 调 LangGraph 主流程 → 实时渲染节点日志 → 结果 / 历史 / 下载 / 临时文件清理 / **全异常路径素材落盘兜底(P0-4)** / **Agent 会话选择与断点续研(v1.5.0)** / **长期记忆回写与文档入库(v1.6.0)** / **HITL 人工确认面板(v1.6.0)**; 历史 JSON 持久化也在此文件 |
+| `graph_builder.py` | Agent 业务核心: 规划 / 工具 / 反思 / 报告节点 + 反思后条件路由; **反思"先判断后截断"时序(P0-1)与 JSON 失败内部重试、连续失败防空转(P0-3)**; LLM 统一超时/重试与 token 预算; `build_graph` 支持可选 `checkpointer`(不传 = 纯内存, 旧行为不变)、`memory_store`(记忆检索节点, v1.6.0)、`human_in_the_loop`(人工确认节点, v1.6.0) |
 | `core/checkpoint_store.py` | SqliteSaver 会话持久化封装(v1.5.0): `CheckpointStore`(saver + 会话登记表 `agent_sessions`)、路径/开关解析(`agent_checkpoints.db` / `CHECKPOINT_DB_PATH` / `CHECKPOINT_PERSIST`)、进程级单例 `get_checkpoint_store()`(不可用时返回 None → 调用方退回内存模式) |
 | `state_schema.py` | State 类型定义: `user_query / sub_tasks / collected_info / reflection / reflection_sufficient / reflection_failures / final_report / iteration_count` 等 |
 | `logging_setup.py` | 统一日志(logs/app.log: 时间戳 + 级别 + 异常堆栈, RotatingFileHandler 轮转; 仅单进程模式) |
 | `tools/*` | 三类工具: 联网搜索、PDF 读取、代码沙盒 —— 全部"只产出素材文本"; 沙盒为子进程 + 路径白名单 + 超时强杀(非生产级, 见顶部安全声明) |
 | `prompts/*` | 全部节点提示词模板(系统 + 用户), 与代码分离, 方便单独调整(升级时保持目录完整, 见 §11) |
-| `tests/`(共 126 条) | **离线单元测试(pytest, 不调用 API)**: 沙盒回归、token 预算、反思解析与时序、素材去重、core 层(配置/历史/文件/预读)、**checkpoint_store 会话持久化(13 条, v1.5.0)**, search 格式化、pdf 分支; `python -m pytest tests`; 覆盖率命令见 §11.4 |
+| `tests/`(共 172 条) | **离线单元测试(pytest, 不调用 API)**: 沙盒回归、token 预算、反思解析与时序、素材去重、core 层(配置/历史/文件/预读)、**checkpoint_store 会话持久化(13 条, v1.5.0)**、**vector_memory 长期记忆(15 条, v1.6.0)**、**report_verifier 引用校验(13 条, v1.6.0)**、**API 服务(8 条, v1.6.0)**、**HITL 人工确认(5 条, v1.6.0)**, search 格式化、pdf 分支; `python -m pytest tests`; 覆盖率命令见 §11.4 |
 | `tests/_e2e_test.py` `tests/test_search.py` | ⚠️ **真实消耗 LLM / 博查 API 额度的联网测试, 手动运行、不进 CI**(见 FAQ Q11) |
 | `scripts/*` | export_md(历史导出 .md)、check_lock_consistency(CI 锁文件一致性校验) |
 | `pytest.ini` `.github/workflows/ci.yml` `.gitlab-ci.yml` `CHANGELOG.md` | 测试配置 / 双平台 CI(测试 + lint + 锁校验)/ 版本变更记录 |
@@ -474,7 +495,7 @@ research_agent/
   不在函数内散落魔法数字(轮次/预算/超时等均有具名常量);
 - **分层规范**: 节点/工具只通过 State 与"素材文本"交互, 不互相 import 调用; 每个工具
   "只产出素材文本、不直接写报告"; 提示词抽离 `prompts/*.txt`, 与代码解耦;
-- **质量门禁**: 全库通过 `ruff check`(E4/E7/E9/F, `noqa` 必须带原因注释); **126 条**离线单测
+- **质量门禁**: 全库通过 `ruff check`(E4/E7/E9/F, `noqa` 必须带原因注释); **172 条**离线单测
   不依赖网络与密钥(2026 P2 新增 67 条 core/tools 层用例); 本地 pytest-cov 覆盖率: core 层
   约 94%(config/history_store/ingest/pdf_reader 100%)、graph_builder 88%、整体约 78%
   (沙盒子进程运行器 _sandbox_runner 于子进程执行, 不计入统计); CI 覆盖测试 / lint / 锁一致性三项。
@@ -528,9 +549,9 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 
 ## 11. 老用户升级迁移指南(从旧版本升级)
 
-> 覆盖范围: 从"1.3.x 及更早的纯字符截断/旧提示词版本"升级到本版本(1.5.0)。改动清单与
-> 原因见 [CHANGELOG.md](CHANGELOG.md)。从 1.4.0 升级到 1.5.0 无需迁移旧数据, 只需了解
-> §11.1 新增的两个可选环境变量与 §11.3 的会话持久化说明。
+> 覆盖范围: 从"1.3.x 及更早的纯字符截断/旧提示词版本"升级到本版本(1.6.0)。改动清单与
+> 原因见 [CHANGELOG.md](CHANGELOG.md)。从 1.5.0 升级到 1.6.0 无需迁移旧数据, 只需了解
+> §11.1 新增的可选环境变量、§11.3 的会话持久化说明与 §11.5 的新增可选功能。
 
 ### 11.1 `.env` 需要新增的环境变量(旧 .env 不必推倒重来, 追加即可)
 
@@ -541,6 +562,10 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 | `CHECKPOINT_DB_PATH` | checkpoint 数据库文件路径(默认项目根目录 `agent_checkpoints.db`; 容器部署建议指向挂载卷, 见 §5.1) | 不填 = 默认路径 |
 | `LLM_TIMEOUT` / `LLM_MAX_OUTPUT_TOKENS` / `LLM_CONTEXT_TOKENS` / `LLM_CLIENT_RETRIES` / `LLM_MAX_RETRIES` | LLM 调用调优(1.3 起引入, 均带默认值) | 不填 = 默认(60s / 8192 / 60000 / 2 / 3) |
 | `SEARCH_TIMEOUT` / `BOCHA_COUNT` / `BOCHA_FRESHNESS` | 搜索调优(均带默认值) | 不填 = 默认 |
+| `MEMORY_ENABLED` | 长期记忆/RAG 总开关(默认 `true`; ChromaDB 不可用时自动降级) | 不填 = 开启 |
+| `MEMORY_TOP_K` | 历史记忆/文档片段各检索条数(默认 3) | 不填 = 默认 |
+| `MEMORY_CHUNK_SIZE` / `MEMORY_CHUNK_OVERLAP` | 上传文档分块大小/重叠(默认 800/100 字符) | 不填 = 默认 |
+| `HUMAN_IN_THE_LOOP` | 人工确认闸门(HITL)总开关(默认 `false`; `true` 时反思判定不足将暂停等待人工决策) | 不填 = 关闭 |
 
 最简单的迁移: 把旧 `.env` 保留, 对照 `.env.example` 注释逐项确认即可(密钥两行
 `OPENAI_API_KEY` / `BOCHA_API_KEY` / `LLM_MODEL` / `OPENAI_BASE_URL` 不变)。
@@ -571,11 +596,15 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
   应用启动时会自动清理 `temp_upload/` 旧残留(partial 素材请提前下载); `agent_checkpoints.db`
   由应用自动创建, 若想清空全部历史会话, 关闭应用后删除该文件即可(不影响历史报告);
 - **安全边界收紧提醒**: 升级后请阅读顶部「安全与部署边界声明」——沙盒为本地原型级,
-  切勿因为版本号升高而把它当成可公网部署的隔离沙箱。
+  切勿因为版本号升高而把它当成可公网部署的隔离沙箱;
+- **新增可选功能(1.6.0)**: 长期记忆/RAG(`MEMORY_ENABLED`, 默认开启, 向量库持久化到
+  `./chroma_db/`)、报告引用校验(自动启用, 报告区显示 ✅/⚠️ 标记)、API 服务(新增
+  `server.py`, 独立于 Streamlit 启动)、HITL 人工确认(`HUMAN_IN_THE_LOOP`, 默认关闭);
+  除 HITL 需在 `.env` 显式开启外, 其余均默认生效且不改变既有任务流程。
 
 ### 11.4 离线测试 & CI(开发者)
 
-- 本地: `python -m pytest tests`(126 条, 不消耗 API); lint: `ruff check .`;
+- 本地: `python -m pytest tests`(172 条, 不消耗 API); lint: `ruff check .`;
 - 覆盖率(本地度量, 可选): `pip install pytest-cov` 后执行
   `python -m pytest tests --cov=core --cov=tools --cov=graph_builder --cov-report=term-missing`;
 - 提交前保证 `python scripts/check_lock_consistency.py` 通过(锁文件一致);
@@ -597,7 +626,7 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 - 用 **Streamlit 构建可交互演示**, 含逐节点实时日志、图表展示、报告下载与 **本地持久化历史**、checkpointer 异常兜底、统一日志 —— 完整的前后端闭环;
 - 代码注释规范、模块划分清晰(入口 / 图构建 / 状态 / 工具 / 提示词 / 日志分离), 适合在面试中快速讲清系统架构与每一处设计取舍;
 - 2026 P1/P3 重构加分点: **core 引擎层与 UI 解耦**(无 Streamlit 依赖的纯逻辑服务层, 可独立单测/复用)、pyproject 工程化、Docker 容器化(密钥不入镜像);
-- 测试体系可量化: **126 条离线单测**(46 条图/沙盒 + 67 条 core/tools 层 + 13 条 checkpoint 会话持久化)、core 层覆盖率约 94%、pytest-cov 接入方式可现场演示。
+- 测试体系可量化: **172 条离线单测**(46 条图/沙盒 + 67 条 core/tools 层 + 13 条 checkpoint 会话持久化 + 41 条记忆/校验/API/HITL)、core 层覆盖率约 94%、pytest-cov 接入方式可现场演示。
 
 > 如实描述为"个人实践原型"即可: 亮点在于亲手把 LLM + Agent 编排 + 工具调用 + Web 界面完整打通, 并做了不少真实工程化细节(重试、限轮、超时、token 预算、沙盒加固、防编造、日志、兜底)。
 
@@ -620,7 +649,7 @@ CI 会自动校验两者一致性(`scripts/check_lock_consistency.py`), 不一�
 
 ### 14.3 使用提示
 
-- 两条简介的数字(轮次上限 10、单测 126 条、双 CI、core 覆盖率≈94%)与仓库现状一致, 面试被追问时可到对应
+- 两条简介的数字(轮次上限 10、单测 172 条、双 CI、core 覆盖率≈94%)与仓库现状一致, 面试被追问时可到对应
   代码/测试中现场展开(推荐按 §2 架构 → §3 技术难点 → 代码注释的顺序讲解);
-- 若简历字数受限, 优先保留"多轮自主迭代 / LLM 容错 / 双层沙盒 / 素材快照兜底 / 126 条单测 + 双 CI";
+- 若简历字数受限, 优先保留"多轮自主迭代 / LLM 容错 / 双层沙盒 / 素材快照兜底 / 172 条单测 + 双 CI";
 - 面试高频追问已在本仓库可查证: 沙盒为何不是生产级(§8/代码注释)、SqliteSaver 为何能跨重启恢复会话、InMemorySaver 模式为何重启丢状态(§8/`core/checkpoint_store.py` 注释)、为什么反思先判断后截断(§3 第 3 条 + `test_graph_builder.py`)、CI 为什么不含 e2e(FAQ Q11)。

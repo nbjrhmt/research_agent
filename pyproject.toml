@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-agent"
-version = "1.5.0"
+version = "1.6.0"
 description = "基于 LangGraph + Streamlit 的多轮反思迭代 AI 调研 Agent: 规划→联网搜索/PDF/受限代码执行→反思→报告, 结论强制素材溯源"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,6 +53,9 @@ dependencies = [
     "matplotlib>=3.8.0",
     "python-dotenv>=1.0.1",
     "tiktoken>=0.7.0",
+    # API 服务化(server.py, v1.6.0): FastAPI + uvicorn 独立于 Streamlit 提供 REST 接口
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
 ]
 
 [project.optional-dependencies]
@@ -68,7 +71,7 @@ dev = [
 # research-agent = "core.cli:main"
 
 [tool.setuptools]
-# 包: core(引擎层) / tools(工具层) / memory(预留记忆模块)
+# 包: core(引擎层) / tools(工具层) / memory(长期记忆层, v1.6.0 启用)
 packages = ["core", "tools", "memory"]
 # 根目录平铺模块: 安装后可直接 import(测试不再依赖 cwd / sys.path)
 py-modules = ["graph_builder", "logging_setup", "state_schema"]

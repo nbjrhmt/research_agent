@@ -2,6 +2,7 @@
 # install: pip install -r requirements-lock.txt
 # python: 3.13.9
 
+fastapi==0.141.1
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 PyPika==0.51.1
